@@ -1,0 +1,328 @@
+/**
+ * Orchestrates batched subtitle translation via llama.cpp and reports progress to the UI.
+ */
+
+import type { OpenAiTier, SubtitleCue, ModelId } from '@utils/types'
+import { buildBatches } from '@utils/batchSubtitles'
+import { modelExists, resolveModelPath, resourcesEngineDir, MODEL_FILES } from './paths'
+import { runGeminiTranslateJob, runGeminiTranslateOneCue } from './geminiTranslate'
+import { runOpenAiTranslateJob, runOpenAiTranslateOneCue } from './openaiTranslate'
+import { LlamaServerManager, TranslationCancelled } from './llamaServer'
+import type { BrowserWindow } from 'electron'
+
+export interface TranslateJobOptions {
+  cues: SubtitleCue[]
+  modelKey: ModelId
+  modelsDir: string
+  nGpuLayers: number
+  /** Required when modelKey is `gemini`. */
+  geminiApiKey?: string
+  /** Required when modelKey is `openai`. */
+  openaiApiKey?: string
+  openaiTier?: OpenAiTier
+  linesPerBatch?: number
+}
+
+function normalizeForCompare(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function hasMyanmarChars(input: string): boolean {
+  return /[\u1000-\u109f]/.test(input)
+}
+
+function looksUntranslated(source: string, translated: string): boolean {
+  const out = translated.trim()
+  if (!out) return true
+  if (hasMyanmarChars(out)) return false
+  return normalizeForCompare(source) === normalizeForCompare(out)
+}
+
+/** Qwen3 / reasoning models often emit section headers before the real answer. */
+function isReasoningOrMetaLine(line: string): boolean {
+  const t = line.trim()
+  if (!t) return true
+  if (hasMyanmarChars(t)) return false
+  if (/^thinking\b[:\s]*/i.test(t)) return true
+  if (/analyze the request/i.test(t)) return true
+  if (/^\*\*[^*]+\*\*\s*$/.test(t)) return true
+  if (/^(#{1,6}\s|[-*]{3,}\s*$)/.test(t)) return true
+  return false
+}
+
+function stripLeadingNumberPrefix(line: string): string {
+  return line.replace(/^\s*(\d+)\s*[\.\)]\s*/, '').trim()
+}
+
+/**
+ * Qwen3.5 “thinking” / reasoning output often puts **Analyze…** or headings first;
+ * the Burmese line is usually after that or is the only line with Myanmar script.
+ */
+function cleanSingleLineOutput(raw: string): string {
+  const normalized = raw
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/`[\s\S]*?`/gi, ' ')
+    .replace(/<redacted_thinking>[\s\S]*?<\/think>/gi, ' ')
+    .replace(/<\/?think>/gi, ' ')
+    .trim()
+  if (!normalized) return ''
+
+  const lines = normalized
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+
+  const substantive = lines.filter((l) => !isReasoningOrMetaLine(l))
+  const myanmarLine = substantive.find((l) => hasMyanmarChars(l))
+  const pick =
+    myanmarLine ??
+    (substantive.length > 0 ? substantive[substantive.length - 1] : undefined) ??
+    lines.filter((l) => !isReasoningOrMetaLine(l)).at(-1) ??
+    lines.at(-1) ??
+    ''
+
+  const cleaned = stripLeadingNumberPrefix(pick)
+  if (/^<[^>]+>$/.test(cleaned)) return ''
+  if (isReasoningOrMetaLine(cleaned) && !hasMyanmarChars(cleaned)) return ''
+  return cleaned
+}
+
+function maxTokensForModel(modelKey: ModelId): number {
+  // Larger “thinking” models need room after reasoning tokens for the actual line.
+  if (modelKey === 'qwen27b') return 512
+  return 160
+}
+
+function buildLinePrompt(modelKey: ModelId, source: string, strict: boolean): string {
+  const antiReason =
+    modelKey === 'qwen27b'
+      ? 'Do not analyze or explain. No headings, no markdown. Myanmar script only; translate names into Burmese script, one line.\n'
+      : ''
+  if (strict) {
+    return (
+      antiReason +
+      'STRICT: Burmese only; translate names into Burmese script. No analysis.\n' +
+      `English: ${source}\n` +
+      'Burmese:'
+    )
+  }
+  return (
+    antiReason +
+    'Translate the subtitle line to Burmese (Myanmar script), including names in Burmese script. Output only Burmese text.\n' +
+    `English: ${source}\n` +
+    'Burmese:'
+  )
+}
+
+function cloneCuesWithTexts(cues: SubtitleCue[], texts: string[]): SubtitleCue[] {
+  return cues.map((c, i) => ({
+    ...c,
+    text: texts[i] ?? c.text,
+  }))
+}
+
+export async function runTranslateJob(
+  win: BrowserWindow,
+  llama: LlamaServerManager,
+  opts: TranslateJobOptions,
+): Promise<SubtitleCue[]> {
+  const { cues, modelKey, modelsDir, nGpuLayers } = opts
+  const fastMode = process.env.SUBTITLE_FAST_TEST === '1'
+  const linesPerBatch = opts.linesPerBatch ?? (fastMode ? 3 : 7)
+
+  llama.beginInference()
+
+  if (modelKey === 'gemini') {
+    const key = opts.geminiApiKey?.trim()
+    if (!key) {
+      throw new Error(
+        'Gemini API key is not set. Open the menu, paste your key from Google AI Studio, and click Save key.',
+      )
+    }
+    return runGeminiTranslateJob(win, llama, { cues, apiKey: key })
+  }
+
+  if (modelKey === 'openai') {
+    const key = opts.openaiApiKey?.trim()
+    if (!key) {
+      throw new Error(
+        'OpenAI API key is not set. Open the menu → Cloud → OpenAI, paste your key, and click Save key.',
+      )
+    }
+    const tier = opts.openaiTier ?? 'normal'
+    return runOpenAiTranslateJob(win, llama, { cues, apiKey: key, tier })
+  }
+
+  if (!modelExists(modelKey, modelsDir)) {
+    const expectedFile = MODEL_FILES[modelKey]
+    throw new Error(
+      `Missing model file for ${modelKey}. Place ${expectedFile} in your models folder.`,
+    )
+  }
+
+  const modelPath = resolveModelPath(modelKey, modelsDir)
+  const engineDir = resourcesEngineDir()
+  await llama.ensureRunning({ engineDir, modelPath, nGpuLayers })
+
+  const batches = buildBatches(cues, linesPerBatch)
+  const translatedTexts: string[] = cues.map((c) => c.text)
+
+  try {
+    let doneBatches = 0
+    for (const batch of batches) {
+      for (let i = 0; i < batch.lines.length; i++) {
+        const source = batch.lines[i] ?? ''
+        const cueIdx = batch.cueIndices[i]
+        const linePrompt = buildLinePrompt(modelKey, source, false)
+        const mt = maxTokensForModel(modelKey)
+
+        let full = ''
+        for await (const piece of llama.completionStream(linePrompt, {
+          maxTokens: mt,
+          temperature: 0.05,
+        })) {
+          full += piece
+          win.webContents.send('translate:stream', {
+            batchIndex: doneBatches,
+            totalBatches: batches.length,
+            partial: full,
+          })
+        }
+
+        let out = cleanSingleLineOutput(full)
+        const needsRetry =
+          looksUntranslated(source, out) ||
+          (modelKey === 'qwen27b' && out.length > 0 && !hasMyanmarChars(out))
+        if (needsRetry) {
+          let strictFull = ''
+          const strictLinePrompt = buildLinePrompt(modelKey, source, true)
+          for await (const piece of llama.completionStream(strictLinePrompt, {
+            maxTokens: mt,
+            temperature: 0,
+          })) {
+            strictFull += piece
+          }
+          out = cleanSingleLineOutput(strictFull)
+        }
+
+        if (
+          out &&
+          !looksUntranslated(source, out) &&
+          (hasMyanmarChars(out) || modelKey !== 'qwen27b')
+        ) {
+          translatedTexts[cueIdx] = out
+        }
+      }
+
+      doneBatches += 1
+      win.webContents.send('translate:progress', {
+        batchIndex: doneBatches,
+        totalBatches: batches.length,
+        percent: Math.round((doneBatches / batches.length) * 100),
+      })
+    }
+
+    return cloneCuesWithTexts(cues, translatedTexts)
+  } catch (e) {
+    if (e instanceof TranslationCancelled) {
+      return cloneCuesWithTexts(cues, translatedTexts)
+    }
+    throw e
+  }
+}
+
+/**
+ * Translates a single cue with the same pipeline as full jobs.
+ */
+export async function runTranslateOneCue(
+  win: BrowserWindow,
+  llama: LlamaServerManager,
+  opts: {
+    cue: SubtitleCue
+    modelKey: ModelId
+    modelsDir: string
+    nGpuLayers: number
+    geminiApiKey?: string
+    openaiApiKey?: string
+    openaiTier?: OpenAiTier
+  },
+): Promise<string> {
+  const { cue, modelKey, modelsDir, nGpuLayers } = opts
+  const source = cue.text
+
+  llama.beginInference()
+
+  if (modelKey === 'gemini') {
+    const key = opts.geminiApiKey?.trim()
+    if (!key) {
+      throw new Error(
+        'Gemini API key is not set. Open the menu, paste your key from Google AI Studio, and click Save key.',
+      )
+    }
+    return runGeminiTranslateOneCue(win, llama, { cue, apiKey: key })
+  }
+
+  if (modelKey === 'openai') {
+    const key = opts.openaiApiKey?.trim()
+    if (!key) {
+      throw new Error(
+        'OpenAI API key is not set. Open the menu → Cloud → OpenAI, paste your key, and click Save key.',
+      )
+    }
+    const tier = opts.openaiTier ?? 'normal'
+    return runOpenAiTranslateOneCue(win, llama, { cue, apiKey: key, tier })
+  }
+
+  if (!modelExists(modelKey, modelsDir)) {
+    const expectedFile = MODEL_FILES[modelKey]
+    throw new Error(
+      `Missing model file for ${modelKey}. Place ${expectedFile} in your models folder.`,
+    )
+  }
+
+  const modelPath = resolveModelPath(modelKey, modelsDir)
+  const engineDir = resourcesEngineDir()
+  await llama.ensureRunning({ engineDir, modelPath, nGpuLayers })
+
+  const mt = maxTokensForModel(modelKey)
+  const linePrompt = buildLinePrompt(modelKey, source, false)
+
+  let full = ''
+  for await (const piece of llama.completionStream(linePrompt, {
+    maxTokens: mt,
+    temperature: 0.05,
+  })) {
+    full += piece
+    win.webContents.send('translate:stream', {
+      batchIndex: 0,
+      totalBatches: 1,
+      partial: full,
+    })
+  }
+
+  let out = cleanSingleLineOutput(full)
+  const needsRetry =
+    looksUntranslated(source, out) ||
+    (modelKey === 'qwen27b' && out.length > 0 && !hasMyanmarChars(out))
+  if (needsRetry) {
+    let strictFull = ''
+    const strictLinePrompt = buildLinePrompt(modelKey, source, true)
+    for await (const piece of llama.completionStream(strictLinePrompt, {
+      maxTokens: mt,
+      temperature: 0,
+    })) {
+      strictFull += piece
+    }
+    out = cleanSingleLineOutput(strictFull)
+  }
+
+  if (out && !looksUntranslated(source, out) && (hasMyanmarChars(out) || modelKey !== 'qwen27b')) {
+    return out
+  }
+  return source
+}

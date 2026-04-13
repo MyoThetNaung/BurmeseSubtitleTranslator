@@ -1,0 +1,95 @@
+{
+  "name": "burmese-subtitle-translator",
+  "version": "1.0.0",
+  "description": "Offline English → Burmese subtitle translation with local Qwen GGUF (llama.cpp)",
+  "main": "out/main/index.js",
+  "author": "",
+  "license": "MIT",
+  "scripts": {
+    "generate-app-icon": "node scripts/generate-app-icon.mjs",
+    "prebuild": "node scripts/generate-app-icon.mjs",
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "dist": "npm run build && electron-builder",
+    "dist:dir": "npm run build && electron-builder --dir"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "electron-store": "^8.2.0",
+    "framer-motion": "^11.18.2",
+    "openai": "^6.34.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "sharp": "^0.34.5",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.11"
+  },
+  "build": {
+    "appId": "com.local.burmese-subtitle-translator",
+    "productName": "Burmese Subtitle Translator",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "build/icon.png"
+    ],
+    "extraResources": [
+      {
+        "from": "../engine",
+        "to": "engine",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../models",
+        "to": "models",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../utils",
+        "to": "utils",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../LICENSES",
+        "to": "LICENSES",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "forceCodeSigning": false,
+    "win": {
+      "icon": "build/icon.png",
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

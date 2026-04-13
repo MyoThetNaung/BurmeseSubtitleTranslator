@@ -1,0 +1,9 @@
+Gemma models
+
+This application is designed to load Gemma-format GGUF weights for local inference.
+
+Uses Gemma models by Google. Gemma is provided under its own license terms from Google.
+Obtain models only from official distribution channels you trust, and comply with the Gemma
+license and acceptable use policy.
+
+See: https://ai.google.dev/gemma/docs
