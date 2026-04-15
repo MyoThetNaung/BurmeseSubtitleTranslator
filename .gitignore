@@ -1,7 +1,9 @@
 app/node_modules/
 app/out/
 app/release/
-models/
-engine/
+models/*
+!models/.gitkeep
+engine/*
+!engine/.gitkeep
 *.log
 .DS_Store
