@@ -1,5 +1,11 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
-import type { SubtitleCue, ModelId, RendererConfig } from '@utils/types'
+import type {
+  SubtitleCue,
+  ModelId,
+  RendererConfig,
+  TranslationLanguage,
+  TranslationMemoryEntry,
+} from '@utils/types'
 
 const api = {
   pathForFile: (file: File) => webUtils.getPathForFile(file),
@@ -23,10 +29,20 @@ const api = {
   readUtf8File: (filePath: string) => ipcRenderer.invoke('fs:readUtf8', filePath),
   writeUtf8File: (filePath: string, data: string) => ipcRenderer.invoke('fs:writeUtf8', filePath, data),
 
-  translate: (payload: { cues: SubtitleCue[]; modelKey: ModelId }) =>
+  translate: (payload: {
+    cues: SubtitleCue[]
+    modelKey: ModelId
+    targetLanguage?: TranslationLanguage
+    translationMemory?: TranslationMemoryEntry[]
+  }) =>
     ipcRenderer.invoke('translate:start', payload),
 
-  translateOne: (payload: { cue: SubtitleCue; modelKey: ModelId }) =>
+  translateOne: (payload: {
+    cue: SubtitleCue
+    modelKey: ModelId
+    targetLanguage?: TranslationLanguage
+    translationMemory?: TranslationMemoryEntry[]
+  }) =>
     ipcRenderer.invoke('translate:one', payload),
 
   cancelTranslate: () => ipcRenderer.invoke('translate:cancel'),

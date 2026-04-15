@@ -11,6 +11,13 @@ export interface SubtitleCue {
 
 export type ModelId = 'qwen9b' | 'qwen27b' | 'gemini' | 'openai'
 
+export type TranslationLanguage = 'myanmar' | 'thai'
+
+export interface TranslationMemoryEntry {
+  source: string
+  target: string
+}
+
 /** OpenAI cloud tier: normal (GPT-5 mini) vs premium (GPT-5). */
 export type OpenAiTier = 'normal' | 'premium'
 
@@ -23,6 +30,10 @@ export interface AppConfig {
   openaiApiKey?: string
   /** When `selectedModel` is `openai`, selects cost vs quality tier. */
   openaiTier?: OpenAiTier
+  /** Cloud translation target language. */
+  cloudTargetLanguage?: TranslationLanguage
+  /** User-taught phrase/sentence memory used to steer future translations. */
+  translationMemory?: TranslationMemoryEntry[]
 }
 
 /** Safe subset from `config:get` (no plaintext API keys). */
@@ -36,6 +47,8 @@ export interface RendererConfig {
   geminiApiKeyConfigured: boolean
   openaiApiKeyConfigured: boolean
   openaiTier: OpenAiTier
+  cloudTargetLanguage: TranslationLanguage
+  translationMemory: TranslationMemoryEntry[]
 }
 
 /** Saved session for continuing translation/editing later (.bsw JSON). */
@@ -54,4 +67,8 @@ export interface SubtitleWorkspace {
   inferenceMode: 'gpu' | 'cpu'
   /** Remembered when using Cloud (OpenAI); optional for older workspace files. */
   openaiTier?: OpenAiTier
+  /** Cloud target language; optional for older workspace files. */
+  cloudTargetLanguage?: TranslationLanguage
+  /** Optional memory snapshot for this workspace. */
+  translationMemory?: TranslationMemoryEntry[]
 }

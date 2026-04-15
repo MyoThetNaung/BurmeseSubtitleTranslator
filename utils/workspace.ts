@@ -1,4 +1,10 @@
-import type { OpenAiTier, SubtitleCue, SubtitleWorkspace } from './types'
+import type {
+  OpenAiTier,
+  SubtitleCue,
+  SubtitleWorkspace,
+  TranslationLanguage,
+  TranslationMemoryEntry,
+} from './types'
 
 function isCue(x: unknown): x is SubtitleCue {
   if (!x || typeof x !== 'object') return false
@@ -12,6 +18,12 @@ function isCue(x: unknown): x is SubtitleCue {
     Number.isFinite(o.endMs) &&
     typeof o.text === 'string'
   )
+}
+
+function isTranslationMemoryEntry(x: unknown): x is TranslationMemoryEntry {
+  if (!x || typeof x !== 'object') return false
+  const o = x as Record<string, unknown>
+  return typeof o.source === 'string' && typeof o.target === 'string'
 }
 
 /**
@@ -72,6 +84,19 @@ export function parseWorkspaceJson(text: string): SubtitleWorkspace {
   if (o.openaiTier === 'normal' || o.openaiTier === 'premium') {
     openaiTier = o.openaiTier
   }
+  let cloudTargetLanguage: TranslationLanguage | undefined
+  if (o.cloudTargetLanguage === 'myanmar' || o.cloudTargetLanguage === 'thai') {
+    cloudTargetLanguage = o.cloudTargetLanguage
+  }
+  let translationMemory: TranslationMemoryEntry[] | undefined
+  if (Array.isArray(o.translationMemory) && o.translationMemory.every(isTranslationMemoryEntry)) {
+    translationMemory = o.translationMemory
+      .map((entry) => ({
+        source: entry.source.trim(),
+        target: entry.target.trim(),
+      }))
+      .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
+  }
 
   const savedAt = typeof o.savedAt === 'string' ? o.savedAt : new Date().toISOString()
   const sourceFileLabel = typeof o.sourceFileLabel === 'string' ? o.sourceFileLabel : ''
@@ -89,5 +114,7 @@ export function parseWorkspaceJson(text: string): SubtitleWorkspace {
     selectedModel,
     inferenceMode,
     ...(openaiTier !== undefined ? { openaiTier } : {}),
+    ...(cloudTargetLanguage !== undefined ? { cloudTargetLanguage } : {}),
+    ...(translationMemory !== undefined ? { translationMemory } : {}),
   }
 }

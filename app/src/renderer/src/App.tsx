@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { parseWorkspaceJson } from '@utils/index'
-import type { OpenAiTier, SubtitleCue, ModelId, SubtitleWorkspace } from '@utils/types'
+import type {
+  OpenAiTier,
+  SubtitleCue,
+  ModelId,
+  SubtitleWorkspace,
+  TranslationLanguage,
+  TranslationMemoryEntry,
+} from '@utils/types'
 import { AnimatedLogo } from './components/AnimatedLogo'
 import { HeaderMatrixOverlay } from './components/HeaderMatrixOverlay'
 
@@ -61,6 +68,13 @@ export function App(): JSX.Element {
   const [openaiApiKeyConfigured, setOpenaiApiKeyConfigured] = useState(false)
   const [openaiKeyDraft, setOpenaiKeyDraft] = useState('')
   const [openAiTier, setOpenAiTier] = useState<OpenAiTier>('normal')
+  const [cloudTargetLanguage, setCloudTargetLanguage] = useState<TranslationLanguage>('myanmar')
+  const [translationMemory, setTranslationMemory] = useState<TranslationMemoryEntry[]>([])
+  const [trainWindowOpen, setTrainWindowOpen] = useState(false)
+  const [trainDirty, setTrainDirty] = useState(false)
+  const [memorySourceDraft, setMemorySourceDraft] = useState('')
+  const [memoryTargetDraft, setMemoryTargetDraft] = useState('')
+  const [memoryHint, setMemoryHint] = useState<string | null>(null)
   const [cloudSettingsTab, setCloudSettingsTab] = useState<'gemini' | 'openai'>('gemini')
 
   const api = window.subtitleApp
@@ -80,6 +94,9 @@ export function App(): JSX.Element {
         setGeminiApiKeyConfigured(cfg.geminiApiKeyConfigured)
         setOpenaiApiKeyConfigured(cfg.openaiApiKeyConfigured)
         setOpenAiTier(cfg.openaiTier)
+        setCloudTargetLanguage(cfg.cloudTargetLanguage)
+        setTranslationMemory(cfg.translationMemory ?? [])
+        setTrainDirty(false)
         if (cfg.inferenceMode === 'cpu' || cfg.inferenceMode === 'gpu') {
           setInferenceMode(cfg.inferenceMode)
         } else {
@@ -196,6 +213,60 @@ export function App(): JSX.Element {
     [api],
   )
 
+  const onCloudTargetLanguageChange = useCallback(
+    async (lang: TranslationLanguage) => {
+      setCloudTargetLanguage(lang)
+      await api.setConfig({ cloudTargetLanguage: lang })
+    },
+    [api],
+  )
+
+  const onAddTranslationMemory = useCallback(async () => {
+    const source = memorySourceDraft.trim()
+    const target = memoryTargetDraft.trim()
+    if (!source || !target) {
+      setMemoryHint('Enter both source phrase and preferred translation.')
+      return
+    }
+    const next = [...translationMemory.filter((entry) => entry.source !== source), { source, target }]
+    setTranslationMemory(next)
+    setMemorySourceDraft('')
+    setMemoryTargetDraft('')
+    setMemoryHint('Saved in memory.')
+    setTrainDirty(false)
+    await api.setConfig({ translationMemory: next })
+  }, [api, memorySourceDraft, memoryTargetDraft, translationMemory])
+
+  const onDeleteTranslationMemory = useCallback(
+    async (idx: number) => {
+      const next = translationMemory.filter((_, i) => i !== idx)
+      setTranslationMemory(next)
+      setMemoryHint('Removed from memory.')
+      setTrainDirty(false)
+      await api.setConfig({ translationMemory: next })
+    },
+    [api, translationMemory],
+  )
+
+  const onMemoryEntryChange = useCallback(
+    (idx: number, field: 'source' | 'target', value: string) => {
+      setTranslationMemory((prev) => prev.map((entry, i) => (i === idx ? { ...entry, [field]: value } : entry)))
+      setTrainDirty(true)
+      setMemoryHint(null)
+    },
+    [],
+  )
+
+  const onSaveTrainingMemory = useCallback(async () => {
+    const cleaned = translationMemory
+      .map((entry) => ({ source: entry.source.trim(), target: entry.target.trim() }))
+      .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
+    setTranslationMemory(cleaned)
+    await api.setConfig({ translationMemory: cleaned })
+    setTrainDirty(false)
+    setMemoryHint('Training data saved.')
+  }, [api, translationMemory])
+
   const onStopTranslate = useCallback(() => {
     void api.cancelTranslate()
   }, [api])
@@ -207,7 +278,12 @@ export function App(): JSX.Element {
     setProgress(0)
     setStreamPreview('')
     try {
-      const out = await api.translate({ cues, modelKey: model })
+      const out = await api.translate({
+        cues,
+        modelKey: model,
+        targetLanguage: cloudTargetLanguage,
+        translationMemory,
+      })
       setTranslated(out)
       setProgress(100)
     } catch (e) {
@@ -217,7 +293,7 @@ export function App(): JSX.Element {
     } finally {
       setBusy(false)
     }
-  }, [api, cues, model])
+  }, [api, cues, model, cloudTargetLanguage, translationMemory])
 
   const onOriginalCueTextChange = useCallback((idx: number, text: string) => {
     setCues((prev) => prev.map((c, i) => (i === idx ? { ...c, text } : c)))
@@ -292,11 +368,15 @@ export function App(): JSX.Element {
     const src = translated
     if (!src?.length) return
     const base = fileLabel ? fileLabel.replace(/\.[^.]+$/, '') : 'subtitles'
-    const path = await api.saveSrtDialog(`${base}.myanmar.srt`)
+    const exportSuffix =
+      (model === 'gemini' || model === 'openai') && cloudTargetLanguage === 'thai'
+        ? 'thai'
+        : 'myanmar'
+    const path = await api.saveSrtDialog(`${base}.${exportSuffix}.srt`)
     if (!path) return
     const data = await api.serializeSubtitle(src)
     await api.writeUtf8File(path, data)
-  }, [api, cues, translated, fileLabel])
+  }, [api, translated, fileLabel, model, cloudTargetLanguage])
 
   const onRetranslateLine = useCallback(
     async (idx: number) => {
@@ -305,7 +385,12 @@ export function App(): JSX.Element {
       setRetranslatingIdx(idx)
       setError(null)
       try {
-        const newText = await api.translateOne({ cue, modelKey: model })
+        const newText = await api.translateOne({
+          cue,
+          modelKey: model,
+          targetLanguage: cloudTargetLanguage,
+          translationMemory,
+        })
         if (newText === cue.text) {
           return
         }
@@ -321,7 +406,7 @@ export function App(): JSX.Element {
         setRetranslatingIdx(null)
       }
     },
-    [api, busy, cues, model, retranslatingIdx],
+    [api, busy, cues, model, retranslatingIdx, cloudTargetLanguage, translationMemory],
   )
 
   const onSaveOriginal = useCallback(async () => {
@@ -365,6 +450,8 @@ export function App(): JSX.Element {
         selectedModel: model,
         inferenceMode,
         openaiTier: openAiTier,
+        cloudTargetLanguage,
+        translationMemory,
       }
       await api.writeUtf8File(path, JSON.stringify(ws, null, 2))
       setWorkspaceHint(`Workspace saved. You can open this file later to continue editing.`)
@@ -383,6 +470,8 @@ export function App(): JSX.Element {
     model,
     inferenceMode,
     openAiTier,
+    cloudTargetLanguage,
+    translationMemory,
     defaultWorkspaceFileName,
   ])
 
@@ -404,11 +493,18 @@ export function App(): JSX.Element {
       setModel(ws.selectedModel)
       setInferenceMode(ws.inferenceMode)
       const nextTier = ws.openaiTier ?? 'normal'
+      const nextTargetLanguage = ws.cloudTargetLanguage ?? 'myanmar'
+      const nextTranslationMemory = ws.translationMemory ?? []
       setOpenAiTier(nextTier)
+      setCloudTargetLanguage(nextTargetLanguage)
+      setTranslationMemory(nextTranslationMemory)
+      setTrainDirty(false)
       await api.setConfig({
         selectedModel: ws.selectedModel,
         inferenceMode: ws.inferenceMode,
         openaiTier: nextTier,
+        cloudTargetLanguage: nextTargetLanguage,
+        translationMemory: nextTranslationMemory,
       })
       setWorkspaceHint(`Loaded workspace from ${r.filePath}`)
     } catch (e) {
@@ -417,6 +513,14 @@ export function App(): JSX.Element {
   }, [api])
 
   const translatingFx = busy || retranslatingIdx !== null
+  const translatedColumnLabel =
+    (model === 'gemini' || model === 'openai') && cloudTargetLanguage === 'thai'
+      ? 'Translated (TH)'
+      : 'Translated (MY)'
+  const translatedPlaceholder =
+    (model === 'gemini' || model === 'openai') && cloudTargetLanguage === 'thai'
+      ? 'Thai translation...'
+      : 'Burmese translation...'
 
   const left = cues
 
@@ -471,6 +575,20 @@ export function App(): JSX.Element {
                   </label>
 
                   <div className="navMenuCloudSection" role="group" aria-label="Cloud API keys">
+                    <label className="field navMenuField">
+                      <span>Cloud translate to</span>
+                      <select
+                        value={cloudTargetLanguage}
+                        disabled={busy || (model !== 'gemini' && model !== 'openai')}
+                        onChange={(e) =>
+                          void onCloudTargetLanguageChange(e.target.value as TranslationLanguage)
+                        }
+                      >
+                        <option value="myanmar">Myanmar (Burmese)</option>
+                        <option value="thai">Thai</option>
+                      </select>
+                    </label>
+
                     <div className="navMenuCloudTabs">
                       <button
                         type="button"
@@ -621,6 +739,18 @@ export function App(): JSX.Element {
           <button
             type="button"
             className="btn"
+            title="Open training memory window"
+            onClick={() => {
+              setTrainWindowOpen(true)
+              setNavMenuOpen(false)
+            }}
+            disabled={busy}
+          >
+            Train
+          </button>
+          <button
+            type="button"
+            className="btn"
             onClick={() => void onExport()}
             disabled={busy || !translated?.length}
           >
@@ -750,7 +880,7 @@ export function App(): JSX.Element {
             <div className="sheetHeaderRow">
               <div className="sheetColHead">Original (EN)</div>
               <div className="sheetColHead">
-                Translated (MY)
+                {translatedColumnLabel}
                 {!translated?.length ? (
                   <span className="paneHeaderHint"> — edit after Translate, or type Burmese here</span>
                 ) : null}
@@ -840,7 +970,7 @@ export function App(): JSX.Element {
                         value={tr}
                         disabled={busy || retranslatingIdx === idx}
                         spellCheck={false}
-                        placeholder="Burmese translation…"
+                        placeholder={translatedPlaceholder}
                         rows={Math.min(8, Math.max(2, tr.split('\n').length || 2))}
                         onChange={(e) => onTranslatedCueTextChange(idx, e.target.value)}
                       />
@@ -852,6 +982,95 @@ export function App(): JSX.Element {
           </div>
         )}
       </main>
+
+      {trainWindowOpen ? (
+        <div className="trainModalBackdrop" onClick={() => setTrainWindowOpen(false)}>
+          <section className="trainModal" onClick={(e) => e.stopPropagation()}>
+            <div className="trainModalHeader">
+              <div className="trainModalTitle">Translation Training Memory</div>
+              <button type="button" className="btn" onClick={() => setTrainWindowOpen(false)}>
+                Close
+              </button>
+            </div>
+
+            <div className="trainModalAddRow">
+              <input
+                type="text"
+                className="editInput trainInput"
+                value={memorySourceDraft}
+                onChange={(e) => setMemorySourceDraft(e.target.value)}
+                placeholder="English source line or phrase"
+                spellCheck={false}
+              />
+              <input
+                type="text"
+                className="editInput trainInput"
+                value={memoryTargetDraft}
+                onChange={(e) => setMemoryTargetDraft(e.target.value)}
+                placeholder="Preferred Myanmar translation"
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                className="btn"
+                disabled={!memorySourceDraft.trim() || !memoryTargetDraft.trim()}
+                onClick={() => void onAddTranslationMemory()}
+              >
+                Add
+              </button>
+            </div>
+
+            <div className="trainModalGridHead">
+              <div>English</div>
+              <div>Myanmar</div>
+              <div>Action</div>
+            </div>
+            <div className="trainModalList">
+              {translationMemory.length ? (
+                translationMemory.map((entry, idx) => (
+                  <div key={`${entry.source}-${idx}`} className="trainModalRow">
+                    <textarea
+                      className="cueTextarea trainTextarea"
+                      value={entry.source}
+                      onChange={(e) => onMemoryEntryChange(idx, 'source', e.target.value)}
+                      spellCheck={false}
+                      rows={2}
+                    />
+                    <textarea
+                      className="cueTextarea trainTextarea"
+                      value={entry.target}
+                      onChange={(e) => onMemoryEntryChange(idx, 'target', e.target.value)}
+                      spellCheck={false}
+                      rows={2}
+                    />
+                    <button
+                      type="button"
+                      className="btn btnStop"
+                      onClick={() => void onDeleteTranslationMemory(idx)}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))
+              ) : (
+                <div className="trainModalEmpty">No training data yet.</div>
+              )}
+            </div>
+
+            <div className="trainModalFooter">
+              {memoryHint ? <span className="editHint">{memoryHint}</span> : <span />}
+              <button
+                type="button"
+                className="btn primary"
+                disabled={!trainDirty}
+                onClick={() => void onSaveTrainingMemory()}
+              >
+                Save changes
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
 
       <footer className="footer">
         <span>{fileLabel ? `Loaded: ${fileLabel}` : 'No file loaded'}</span>

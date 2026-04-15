@@ -1011,3 +1011,91 @@ body {
 .sep {
   opacity: 0.5;
 }
+
+.trainModalBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.trainModal {
+  width: min(1000px, 96vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, #141c2e, #0f1522);
+  padding: 14px;
+}
+
+.trainModalHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.trainModalTitle {
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.trainModalAddRow {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.trainInput {
+  max-width: none;
+  width: 100%;
+}
+
+.trainModalGridHead {
+  display: grid;
+  grid-template-columns: 1fr 1fr 110px;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trainModalList {
+  min-height: 120px;
+  max-height: 52vh;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trainModalRow {
+  display: grid;
+  grid-template-columns: 1fr 1fr 110px;
+  gap: 8px;
+  align-items: start;
+}
+
+.trainTextarea {
+  min-height: 64px;
+  resize: vertical;
+}
+
+.trainModalEmpty {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 12px 4px;
+}
+
+.trainModalFooter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}

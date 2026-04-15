@@ -4,7 +4,14 @@ import fs from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import Store from 'electron-store'
-import type { SubtitleCue, ModelId, AppConfig, OpenAiTier } from '@utils/types'
+import type {
+  SubtitleCue,
+  ModelId,
+  AppConfig,
+  OpenAiTier,
+  TranslationLanguage,
+  TranslationMemoryEntry,
+} from '@utils/types'
 import { parseSrt, serializeSrt } from '@utils/index'
 import { LlamaServerManager } from './llamaServer'
 import {
@@ -24,6 +31,7 @@ const store = new Store<AppConfig & { nGpuLayers?: number }>({
     selectedModel: 'qwen9b',
     modelsDir: undefined,
     openaiTier: 'normal' satisfies OpenAiTier,
+    cloudTargetLanguage: 'myanmar' satisfies TranslationLanguage,
     nGpuLayers: (() => {
       const raw = process.env.SUBTITLE_LLM_NGL
       if (raw === undefined || raw === '') return 99
@@ -125,6 +133,35 @@ async function firstRunFlow(): Promise<void> {
 }
 
 function registerIpc(): void {
+  const readTranslationMemory = (): TranslationMemoryEntry[] => {
+    return Array.isArray(store.get('translationMemory'))
+      ? (store.get('translationMemory') as TranslationMemoryEntry[])
+          .map((entry) => ({
+            source: typeof entry?.source === 'string' ? entry.source.trim() : '',
+            target: typeof entry?.target === 'string' ? entry.target.trim() : '',
+          }))
+          .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
+          .slice(0, 500)
+      : []
+  }
+
+  const mergeTranslationMemory = (
+    base: TranslationMemoryEntry[],
+    extra: TranslationMemoryEntry[],
+  ): TranslationMemoryEntry[] => {
+    const bySource = new Map<string, TranslationMemoryEntry>()
+    for (const entry of base) {
+      bySource.set(entry.source.toLowerCase(), entry)
+    }
+    for (const entry of extra) {
+      const source = entry.source.trim()
+      const target = entry.target.trim()
+      if (!source || !target) continue
+      bySource.set(source.toLowerCase(), { source, target })
+    }
+    return [...bySource.values()].slice(0, 500)
+  }
+
   ipcMain.handle('config:get', async () => {
     const modelsDir = resolveDefaultModelsDir(store.get('modelsDir'))
     const raw = store.get('selectedModel')
@@ -137,6 +174,9 @@ function registerIpc(): void {
     const geminiKey = store.get('geminiApiKey')
     const openaiKey = store.get('openaiApiKey')
     const openaiTier: OpenAiTier = store.get('openaiTier') === 'premium' ? 'premium' : 'normal'
+    const cloudTargetLanguage: TranslationLanguage =
+      store.get('cloudTargetLanguage') === 'thai' ? 'thai' : 'myanmar'
+    const translationMemory = readTranslationMemory()
     return {
       selectedModel: safeModel,
       modelsDir: store.get('modelsDir') ?? null,
@@ -147,6 +187,8 @@ function registerIpc(): void {
       geminiApiKeyConfigured: typeof geminiKey === 'string' && geminiKey.trim().length > 0,
       openaiApiKeyConfigured: typeof openaiKey === 'string' && openaiKey.trim().length > 0,
       openaiTier,
+      cloudTargetLanguage,
+      translationMemory,
     }
   })
 
@@ -172,6 +214,19 @@ function registerIpc(): void {
       }
       if (partial.openaiTier === 'normal' || partial.openaiTier === 'premium') {
         store.set('openaiTier', partial.openaiTier)
+      }
+      if (partial.cloudTargetLanguage === 'myanmar' || partial.cloudTargetLanguage === 'thai') {
+        store.set('cloudTargetLanguage', partial.cloudTargetLanguage)
+      }
+      if (Array.isArray(partial.translationMemory)) {
+        const cleaned = (partial.translationMemory as TranslationMemoryEntry[])
+          .map((entry) => ({
+            source: typeof entry?.source === 'string' ? entry.source.trim() : '',
+            target: typeof entry?.target === 'string' ? entry.target.trim() : '',
+          }))
+          .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
+          .slice(0, 500)
+        store.set('translationMemory', cleaned)
       }
       if (partial.modelsDir !== undefined) store.set('modelsDir', partial.modelsDir)
       if (typeof partial.nGpuLayers === 'number' && partial.nGpuLayers >= 0) {
@@ -274,7 +329,15 @@ function registerIpc(): void {
 
   ipcMain.handle(
     'translate:start',
-    async (event, payload: { cues: SubtitleCue[]; modelKey: ModelId }) => {
+    async (
+      event,
+      payload: {
+        cues: SubtitleCue[]
+        modelKey: ModelId
+        targetLanguage?: TranslationLanguage
+        translationMemory?: TranslationMemoryEntry[]
+      },
+    ) => {
       const win = BrowserWindow.fromWebContents(event.sender)
       if (!win) throw new Error('No window')
 
@@ -291,7 +354,26 @@ function registerIpc(): void {
       const tierRaw = store.get('openaiTier')
       const openaiTier: OpenAiTier = tierRaw === 'premium' ? 'premium' : 'normal'
 
-      return runTranslateJob(win, llama, {
+      const targetLanguage: TranslationLanguage =
+        payload.targetLanguage === 'thai' || payload.targetLanguage === 'myanmar'
+          ? payload.targetLanguage
+          : store.get('cloudTargetLanguage') === 'thai'
+            ? 'thai'
+            : 'myanmar'
+      store.set('cloudTargetLanguage', targetLanguage)
+      if (Array.isArray(payload.translationMemory)) {
+        const cleanedPayloadMemory = payload.translationMemory
+          .map((entry) => ({
+            source: typeof entry?.source === 'string' ? entry.source.trim() : '',
+            target: typeof entry?.target === 'string' ? entry.target.trim() : '',
+          }))
+          .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
+          .slice(0, 500)
+        store.set('translationMemory', cleanedPayloadMemory)
+      }
+      const translationMemory = readTranslationMemory()
+
+      const result = await runTranslateJob(win, llama, {
         cues: payload.cues,
         modelKey,
         modelsDir,
@@ -299,7 +381,17 @@ function registerIpc(): void {
         geminiApiKey: store.get('geminiApiKey'),
         openaiApiKey: store.get('openaiApiKey'),
         openaiTier,
+        targetLanguage,
+        translationMemory,
       })
+      const learnedPairs: TranslationMemoryEntry[] = result
+        .map((cue, i) => ({
+          source: payload.cues[i]?.text?.trim() ?? '',
+          target: cue.text.trim(),
+        }))
+        .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
+      store.set('translationMemory', mergeTranslationMemory(translationMemory, learnedPairs))
+      return result
     },
   )
 
@@ -310,7 +402,15 @@ function registerIpc(): void {
 
   ipcMain.handle(
     'translate:one',
-    async (event, payload: { cue: SubtitleCue; modelKey: ModelId }) => {
+    async (
+      event,
+      payload: {
+        cue: SubtitleCue
+        modelKey: ModelId
+        targetLanguage?: TranslationLanguage
+        translationMemory?: TranslationMemoryEntry[]
+      },
+    ) => {
       const win = BrowserWindow.fromWebContents(event.sender)
       if (!win) throw new Error('No window')
 
@@ -327,7 +427,26 @@ function registerIpc(): void {
       const tierRaw = store.get('openaiTier')
       const openaiTier: OpenAiTier = tierRaw === 'premium' ? 'premium' : 'normal'
 
-      return runTranslateOneCue(win, llama, {
+      const targetLanguage: TranslationLanguage =
+        payload.targetLanguage === 'thai' || payload.targetLanguage === 'myanmar'
+          ? payload.targetLanguage
+          : store.get('cloudTargetLanguage') === 'thai'
+            ? 'thai'
+            : 'myanmar'
+      store.set('cloudTargetLanguage', targetLanguage)
+      if (Array.isArray(payload.translationMemory)) {
+        const cleanedPayloadMemory = payload.translationMemory
+          .map((entry) => ({
+            source: typeof entry?.source === 'string' ? entry.source.trim() : '',
+            target: typeof entry?.target === 'string' ? entry.target.trim() : '',
+          }))
+          .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
+          .slice(0, 500)
+        store.set('translationMemory', cleanedPayloadMemory)
+      }
+      const translationMemory = readTranslationMemory()
+
+      const result = await runTranslateOneCue(win, llama, {
         cue: payload.cue,
         modelKey,
         modelsDir,
@@ -335,7 +454,18 @@ function registerIpc(): void {
         geminiApiKey: store.get('geminiApiKey'),
         openaiApiKey: store.get('openaiApiKey'),
         openaiTier,
+        targetLanguage,
+        translationMemory,
       })
+      if (payload.cue.text.trim() && result.trim()) {
+        store.set(
+          'translationMemory',
+          mergeTranslationMemory(translationMemory, [
+            { source: payload.cue.text.trim(), target: result.trim() },
+          ]),
+        )
+      }
+      return result
     },
   )
 }

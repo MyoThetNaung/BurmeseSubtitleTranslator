@@ -2,7 +2,13 @@
  * Orchestrates batched subtitle translation via llama.cpp and reports progress to the UI.
  */
 
-import type { OpenAiTier, SubtitleCue, ModelId } from '@utils/types'
+import type {
+  OpenAiTier,
+  SubtitleCue,
+  ModelId,
+  TranslationLanguage,
+  TranslationMemoryEntry,
+} from '@utils/types'
 import { buildBatches } from '@utils/batchSubtitles'
 import { modelExists, resolveModelPath, resourcesEngineDir, MODEL_FILES } from './paths'
 import { runGeminiTranslateJob, runGeminiTranslateOneCue } from './geminiTranslate'
@@ -20,6 +26,8 @@ export interface TranslateJobOptions {
   /** Required when modelKey is `openai`. */
   openaiApiKey?: string
   openaiTier?: OpenAiTier
+  targetLanguage?: TranslationLanguage
+  translationMemory?: TranslationMemoryEntry[]
   linesPerBatch?: number
 }
 
@@ -40,6 +48,37 @@ function looksUntranslated(source: string, translated: string): boolean {
   if (!out) return true
   if (hasMyanmarChars(out)) return false
   return normalizeForCompare(source) === normalizeForCompare(out)
+}
+
+/**
+ * Some local models echo glossary/training entries (e.g. `"foo" => "bar"`) instead of translating
+ * the current subtitle line. Treat these as invalid candidate outputs.
+ */
+function looksLikeGlossaryEcho(translated: string): boolean {
+  const out = translated.trim()
+  if (!out) return false
+  return (
+    /=>|->/.test(out) ||
+    /^[*-]\s*["'`].+["'`]\s*(=>|->|:)\s*["'`].+["'`]\s*$/i.test(out) ||
+    /^["'`].+["'`]\s*(=>|->|:)\s*["'`].+["'`]\s*$/i.test(out)
+  )
+}
+
+/**
+ * Detect pathological repetition loops from local models, e.g. the same syllable/word repeated
+ * many times. These are malformed outputs and should trigger retry/fallback.
+ */
+function looksLikeRepetitionSpam(translated: string): boolean {
+  const out = translated.trim()
+  if (!out) return false
+  const tokens = out.split(/\s+/).filter(Boolean)
+  if (tokens.length >= 8) {
+    const unique = new Set(tokens.map((t) => t.toLowerCase())).size
+    if (unique <= 2 && tokens.length / Math.max(1, unique) >= 4) return true
+  }
+  if (/([\u1000-\u109f]{1,4})(?:\s*\1){5,}/u.test(out)) return true
+  if (/([A-Za-z]{1,6})(?:\s+\1){5,}/.test(out)) return true
+  return false
 }
 
 /** Qwen3 / reasoning models often emit section headers before the real answer. */
@@ -98,7 +137,54 @@ function maxTokensForModel(modelKey: ModelId): number {
   return 160
 }
 
-function buildLinePrompt(modelKey: ModelId, source: string, strict: boolean): string {
+function normalizeForKey(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function buildExactMemoryMap(memory: TranslationMemoryEntry[]): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const entry of memory) {
+    const source = entry.source.trim()
+    const target = entry.target.trim()
+    if (!source || !target) continue
+    map.set(normalizeForKey(source), target)
+  }
+  return map
+}
+
+function glossaryPromptSection(memory: TranslationMemoryEntry[]): string {
+  const cleaned = memory
+    .map((entry) => ({ source: entry.source.trim(), target: entry.target.trim() }))
+    .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
+    .slice(0, 120)
+  if (!cleaned.length) return ''
+  return (
+    'Terminology memory (must follow if source phrase appears):\n' +
+    cleaned.map((entry) => `- "${entry.source}" => "${entry.target}"`).join('\n') +
+    '\n'
+  )
+}
+
+function applyTranslationMemory(
+  source: string,
+  translated: string,
+  memory: TranslationMemoryEntry[],
+): string {
+  const exact = buildExactMemoryMap(memory).get(normalizeForKey(source))
+  if (exact) return exact
+  return translated
+}
+
+function buildLinePrompt(
+  modelKey: ModelId,
+  source: string,
+  strict: boolean,
+  memory: TranslationMemoryEntry[],
+): string {
+  const memorySection = glossaryPromptSection(memory)
   const antiReason =
     modelKey === 'qwen27b'
       ? 'Do not analyze or explain. No headings, no markdown. Myanmar script only; translate names into Burmese script, one line.\n'
@@ -107,6 +193,7 @@ function buildLinePrompt(modelKey: ModelId, source: string, strict: boolean): st
     return (
       antiReason +
       'STRICT: Burmese only; translate names into Burmese script. No analysis.\n' +
+      memorySection +
       `English: ${source}\n` +
       'Burmese:'
     )
@@ -114,6 +201,16 @@ function buildLinePrompt(modelKey: ModelId, source: string, strict: boolean): st
   return (
     antiReason +
     'Translate the subtitle line to Burmese (Myanmar script), including names in Burmese script. Output only Burmese text.\n' +
+    memorySection +
+    `English: ${source}\n` +
+    'Burmese:'
+  )
+}
+
+function buildBareStrictLinePrompt(source: string): string {
+  return (
+    'Translate this one English subtitle line to Burmese (Myanmar script).\n' +
+    'Output only one Burmese line. No list. No quotes. No glossary format. No repeated words.\n' +
     `English: ${source}\n` +
     'Burmese:'
   )
@@ -132,6 +229,8 @@ export async function runTranslateJob(
   opts: TranslateJobOptions,
 ): Promise<SubtitleCue[]> {
   const { cues, modelKey, modelsDir, nGpuLayers } = opts
+  const translationMemory = opts.translationMemory ?? []
+  const exactMemoryMap = buildExactMemoryMap(translationMemory)
   const fastMode = process.env.SUBTITLE_FAST_TEST === '1'
   const linesPerBatch = opts.linesPerBatch ?? (fastMode ? 3 : 7)
 
@@ -144,7 +243,12 @@ export async function runTranslateJob(
         'Gemini API key is not set. Open the menu, paste your key from Google AI Studio, and click Save key.',
       )
     }
-    return runGeminiTranslateJob(win, llama, { cues, apiKey: key })
+    return runGeminiTranslateJob(win, llama, {
+      cues,
+      apiKey: key,
+      targetLanguage: opts.targetLanguage ?? 'myanmar',
+      translationMemory,
+    })
   }
 
   if (modelKey === 'openai') {
@@ -155,11 +259,17 @@ export async function runTranslateJob(
       )
     }
     const tier = opts.openaiTier ?? 'normal'
-    return runOpenAiTranslateJob(win, llama, { cues, apiKey: key, tier })
+    return runOpenAiTranslateJob(win, llama, {
+      cues,
+      apiKey: key,
+      tier,
+      targetLanguage: opts.targetLanguage ?? 'myanmar',
+      translationMemory,
+    })
   }
 
   if (!modelExists(modelKey, modelsDir)) {
-    const expectedFile = MODEL_FILES[modelKey]
+    const expectedFile = modelKey === 'qwen27b' ? MODEL_FILES.qwen27b : MODEL_FILES.qwen9b
     throw new Error(
       `Missing model file for ${modelKey}. Place ${expectedFile} in your models folder.`,
     )
@@ -178,7 +288,12 @@ export async function runTranslateJob(
       for (let i = 0; i < batch.lines.length; i++) {
         const source = batch.lines[i] ?? ''
         const cueIdx = batch.cueIndices[i]
-        const linePrompt = buildLinePrompt(modelKey, source, false)
+        const remembered = exactMemoryMap.get(normalizeForKey(source))
+        if (remembered) {
+          translatedTexts[cueIdx] = remembered
+          continue
+        }
+        const linePrompt = buildLinePrompt(modelKey, source, false, translationMemory)
         const mt = maxTokensForModel(modelKey)
 
         let full = ''
@@ -197,10 +312,12 @@ export async function runTranslateJob(
         let out = cleanSingleLineOutput(full)
         const needsRetry =
           looksUntranslated(source, out) ||
+          looksLikeGlossaryEcho(out) ||
+          looksLikeRepetitionSpam(out) ||
           (modelKey === 'qwen27b' && out.length > 0 && !hasMyanmarChars(out))
         if (needsRetry) {
           let strictFull = ''
-          const strictLinePrompt = buildLinePrompt(modelKey, source, true)
+          const strictLinePrompt = buildLinePrompt(modelKey, source, true, translationMemory)
           for await (const piece of llama.completionStream(strictLinePrompt, {
             maxTokens: mt,
             temperature: 0,
@@ -208,14 +325,34 @@ export async function runTranslateJob(
             strictFull += piece
           }
           out = cleanSingleLineOutput(strictFull)
+          const stillBad =
+            looksUntranslated(source, out) ||
+            looksLikeGlossaryEcho(out) ||
+            looksLikeRepetitionSpam(out) ||
+            (modelKey === 'qwen27b' && out.length > 0 && !hasMyanmarChars(out))
+          if (stillBad) {
+            let bareStrictFull = ''
+            const bareStrictPrompt = buildBareStrictLinePrompt(source)
+            for await (const piece of llama.completionStream(bareStrictPrompt, {
+              maxTokens: mt,
+              temperature: 0,
+            })) {
+              bareStrictFull += piece
+            }
+            out = cleanSingleLineOutput(bareStrictFull)
+          }
         }
 
         if (
           out &&
           !looksUntranslated(source, out) &&
+          !looksLikeGlossaryEcho(out) &&
+          !looksLikeRepetitionSpam(out) &&
           (hasMyanmarChars(out) || modelKey !== 'qwen27b')
         ) {
-          translatedTexts[cueIdx] = out
+          const stable = applyTranslationMemory(source, out, translationMemory)
+          translatedTexts[cueIdx] = stable
+          exactMemoryMap.set(normalizeForKey(source), stable)
         }
       }
 
@@ -250,10 +387,14 @@ export async function runTranslateOneCue(
     geminiApiKey?: string
     openaiApiKey?: string
     openaiTier?: OpenAiTier
+    targetLanguage?: TranslationLanguage
+    translationMemory?: TranslationMemoryEntry[]
   },
 ): Promise<string> {
   const { cue, modelKey, modelsDir, nGpuLayers } = opts
   const source = cue.text
+  const translationMemory = opts.translationMemory ?? []
+  const exactMemoryMap = buildExactMemoryMap(translationMemory)
 
   llama.beginInference()
 
@@ -264,7 +405,12 @@ export async function runTranslateOneCue(
         'Gemini API key is not set. Open the menu, paste your key from Google AI Studio, and click Save key.',
       )
     }
-    return runGeminiTranslateOneCue(win, llama, { cue, apiKey: key })
+    return runGeminiTranslateOneCue(win, llama, {
+      cue,
+      apiKey: key,
+      targetLanguage: opts.targetLanguage ?? 'myanmar',
+      translationMemory,
+    })
   }
 
   if (modelKey === 'openai') {
@@ -275,11 +421,17 @@ export async function runTranslateOneCue(
       )
     }
     const tier = opts.openaiTier ?? 'normal'
-    return runOpenAiTranslateOneCue(win, llama, { cue, apiKey: key, tier })
+    return runOpenAiTranslateOneCue(win, llama, {
+      cue,
+      apiKey: key,
+      tier,
+      targetLanguage: opts.targetLanguage ?? 'myanmar',
+      translationMemory,
+    })
   }
 
   if (!modelExists(modelKey, modelsDir)) {
-    const expectedFile = MODEL_FILES[modelKey]
+    const expectedFile = modelKey === 'qwen27b' ? MODEL_FILES.qwen27b : MODEL_FILES.qwen9b
     throw new Error(
       `Missing model file for ${modelKey}. Place ${expectedFile} in your models folder.`,
     )
@@ -290,7 +442,11 @@ export async function runTranslateOneCue(
   await llama.ensureRunning({ engineDir, modelPath, nGpuLayers })
 
   const mt = maxTokensForModel(modelKey)
-  const linePrompt = buildLinePrompt(modelKey, source, false)
+  const remembered = exactMemoryMap.get(normalizeForKey(source))
+  if (remembered) {
+    return remembered
+  }
+  const linePrompt = buildLinePrompt(modelKey, source, false, translationMemory)
 
   let full = ''
   for await (const piece of llama.completionStream(linePrompt, {
@@ -308,10 +464,12 @@ export async function runTranslateOneCue(
   let out = cleanSingleLineOutput(full)
   const needsRetry =
     looksUntranslated(source, out) ||
+    looksLikeGlossaryEcho(out) ||
+    looksLikeRepetitionSpam(out) ||
     (modelKey === 'qwen27b' && out.length > 0 && !hasMyanmarChars(out))
   if (needsRetry) {
     let strictFull = ''
-    const strictLinePrompt = buildLinePrompt(modelKey, source, true)
+    const strictLinePrompt = buildLinePrompt(modelKey, source, true, translationMemory)
     for await (const piece of llama.completionStream(strictLinePrompt, {
       maxTokens: mt,
       temperature: 0,
@@ -319,10 +477,32 @@ export async function runTranslateOneCue(
       strictFull += piece
     }
     out = cleanSingleLineOutput(strictFull)
+    const stillBad =
+      looksUntranslated(source, out) ||
+      looksLikeGlossaryEcho(out) ||
+      looksLikeRepetitionSpam(out) ||
+      (modelKey === 'qwen27b' && out.length > 0 && !hasMyanmarChars(out))
+    if (stillBad) {
+      let bareStrictFull = ''
+      const bareStrictPrompt = buildBareStrictLinePrompt(source)
+      for await (const piece of llama.completionStream(bareStrictPrompt, {
+        maxTokens: mt,
+        temperature: 0,
+      })) {
+        bareStrictFull += piece
+      }
+      out = cleanSingleLineOutput(bareStrictFull)
+    }
   }
 
-  if (out && !looksUntranslated(source, out) && (hasMyanmarChars(out) || modelKey !== 'qwen27b')) {
-    return out
+  if (
+    out &&
+    !looksUntranslated(source, out) &&
+    !looksLikeGlossaryEcho(out) &&
+    !looksLikeRepetitionSpam(out) &&
+    (hasMyanmarChars(out) || modelKey !== 'qwen27b')
+  ) {
+    return applyTranslationMemory(source, out, translationMemory)
   }
   return source
 }

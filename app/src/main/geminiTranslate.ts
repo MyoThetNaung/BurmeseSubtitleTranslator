@@ -3,7 +3,7 @@
  */
 
 import { GoogleGenerativeAI } from '@google/generative-ai'
-import type { SubtitleCue } from '@utils/types'
+import type { SubtitleCue, TranslationLanguage, TranslationMemoryEntry } from '@utils/types'
 import { buildBatches } from '@utils/batchSubtitles'
 import {
   buildStrictBurmesePrompt,
@@ -40,6 +40,34 @@ function looksUntranslated(source: string, translated: string): boolean {
   return normalizeForCompare(source) === normalizeForCompare(out)
 }
 
+function normalizeForKey(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function buildExactMemoryMap(memory: TranslationMemoryEntry[]): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const entry of memory) {
+    const source = entry.source.trim()
+    const target = entry.target.trim()
+    if (!source || !target) continue
+    map.set(normalizeForKey(source), target)
+  }
+  return map
+}
+
+function applyTranslationMemory(
+  source: string,
+  translated: string,
+  memory: TranslationMemoryEntry[],
+): string {
+  const exact = buildExactMemoryMap(memory).get(normalizeForKey(source))
+  if (exact) return exact
+  return translated
+}
+
 function cloneCuesWithTexts(cues: SubtitleCue[], texts: string[]): SubtitleCue[] {
   return cues.map((c, i) => ({
     ...c,
@@ -50,9 +78,14 @@ function cloneCuesWithTexts(cues: SubtitleCue[], texts: string[]): SubtitleCue[]
 export async function runGeminiTranslateJob(
   win: BrowserWindow,
   llama: LlamaServerManager,
-  opts: { cues: SubtitleCue[]; apiKey: string },
+  opts: {
+    cues: SubtitleCue[]
+    apiKey: string
+    targetLanguage: TranslationLanguage
+    translationMemory: TranslationMemoryEntry[]
+  },
 ): Promise<SubtitleCue[]> {
-  const { cues, apiKey } = opts
+  const { cues, apiKey, targetLanguage, translationMemory } = opts
   const fastMode = process.env.SUBTITLE_FAST_TEST === '1'
   const linesPerBatch = fastMode ? 3 : 7
 
@@ -61,6 +94,7 @@ export async function runGeminiTranslateJob(
 
   const batches = buildBatches(cues, linesPerBatch)
   const translatedTexts: string[] = cues.map((c) => c.text)
+  const exactMemoryMap = buildExactMemoryMap(translationMemory)
 
   let doneBatches = 0
   try {
@@ -70,7 +104,7 @@ export async function runGeminiTranslateJob(
       }
 
       const subtitleBatch = formatBatchForPrompt(batch.lines)
-      let prompt = buildTranslationPrompt(subtitleBatch)
+      let prompt = buildTranslationPrompt(subtitleBatch, targetLanguage, translationMemory)
 
       const runStream = async (p: string): Promise<string> => {
         const stream = await model.generateContentStream({
@@ -107,20 +141,28 @@ export async function runGeminiTranslateJob(
         suspiciousCount >= Math.max(1, Math.ceil(batch.lines.length * 0.6))
 
       if (shouldRetryStrict) {
-        prompt = buildStrictBurmesePrompt(subtitleBatch)
+        prompt = buildStrictBurmesePrompt(subtitleBatch, targetLanguage, translationMemory)
         full = await runStream(prompt)
         outLines = parseTranslatedLines(full, batch.lines.length)
       }
 
       for (let i = 0; i < batch.cueIndices.length; i++) {
         const cueIdx = batch.cueIndices[i]
+        const source = batch.lines[i] ?? ''
+        const remembered = exactMemoryMap.get(normalizeForKey(source))
+        if (remembered) {
+          translatedTexts[cueIdx] = remembered
+          continue
+        }
         const next = outLines[i]
         if (
           typeof next === 'string' &&
           next.trim().length > 0 &&
-          !looksUntranslated(batch.lines[i] ?? '', next)
+          !looksUntranslated(source, next)
         ) {
-          translatedTexts[cueIdx] = next
+          const stable = applyTranslationMemory(source, next, translationMemory)
+          translatedTexts[cueIdx] = stable
+          exactMemoryMap.set(normalizeForKey(source), stable)
         }
       }
 
@@ -144,9 +186,14 @@ export async function runGeminiTranslateJob(
 export async function runGeminiTranslateOneCue(
   win: BrowserWindow,
   llama: LlamaServerManager,
-  opts: { cue: SubtitleCue; apiKey: string },
+  opts: {
+    cue: SubtitleCue
+    apiKey: string
+    targetLanguage: TranslationLanguage
+    translationMemory: TranslationMemoryEntry[]
+  },
 ): Promise<string> {
-  const { cue, apiKey } = opts
+  const { cue, apiKey, targetLanguage, translationMemory } = opts
   const source = cue.text
 
   if (llama.isInferenceCancelled()) {
@@ -155,11 +202,21 @@ export async function runGeminiTranslateOneCue(
 
   const genAI = new GoogleGenerativeAI(apiKey)
   const model = genAI.getGenerativeModel({ model: geminiModelName() })
+  const remembered = buildExactMemoryMap(translationMemory).get(normalizeForKey(source))
+  if (remembered) return remembered
 
+  const targetLabel = targetLanguage === 'thai' ? 'Thai' : 'Burmese'
+  const targetScript = targetLanguage === 'thai' ? 'Thai script' : 'Myanmar script'
   const userPrompt =
-    'Translate the subtitle line to Burmese (Myanmar script), including person and place names in Burmese script. Output only Burmese text, one line.\n' +
+    `Translate the subtitle line to ${targetLabel} (${targetScript}), including person and place names in ${targetScript}. Output only ${targetLabel} text, one line.\n` +
+    (translationMemory.length
+      ? `Terminology memory (must follow if source phrase appears):\n${translationMemory
+          .slice(0, 120)
+          .map((entry) => `- "${entry.source}" => "${entry.target}"`)
+          .join('\n')}\n`
+      : '') +
     `English: ${source}\n` +
-    'Burmese:'
+    `${targetLabel}:`
 
   const stream = await model.generateContentStream({
     contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
@@ -186,10 +243,13 @@ export async function runGeminiTranslateOneCue(
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean)
-  const myanmarLine = lines.find((l) => hasMyanmarChars(l))
-  const pick = myanmarLine ?? lines[lines.length - 1] ?? ''
+  const targetScriptLine =
+    targetLanguage === 'thai'
+      ? lines.find((l) => /[\u0E00-\u0E7F]/.test(l))
+      : lines.find((l) => hasMyanmarChars(l))
+  const pick = targetScriptLine ?? lines[lines.length - 1] ?? ''
   const out = pick.replace(/^\s*(\d+)\s*[\.\)]\s*/, '').trim()
 
-  if (out && !looksUntranslated(source, out)) return out
+  if (out && !looksUntranslated(source, out)) return applyTranslationMemory(source, out, translationMemory)
   return source
 }
