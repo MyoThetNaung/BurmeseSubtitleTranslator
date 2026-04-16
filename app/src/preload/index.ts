@@ -3,6 +3,7 @@ import type {
   SubtitleCue,
   ModelId,
   RendererConfig,
+  AppConfig,
   TranslationLanguage,
   TranslationMemoryEntry,
 } from '@utils/types'
@@ -11,7 +12,8 @@ const api = {
   pathForFile: (file: File) => webUtils.getPathForFile(file),
 
   getConfig: (): Promise<RendererConfig> => ipcRenderer.invoke('config:get'),
-  setConfig: (partial: Record<string, unknown>) => ipcRenderer.invoke('config:set', partial),
+  setConfig: (partial: Partial<AppConfig & { nGpuLayers?: number; inferenceMode?: 'cpu' | 'gpu' }>) =>
+    ipcRenderer.invoke('config:set', partial),
 
   copyModelsToAppData: () => ipcRenderer.invoke('models:copyToAppData'),
   getModelsStatus: () => ipcRenderer.invoke('models:status'),

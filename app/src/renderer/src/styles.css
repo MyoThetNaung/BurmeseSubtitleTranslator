@@ -82,6 +82,18 @@ body {
   background-color: transparent;
 }
 
+.sequelPresetField {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+}
+
+.sequelPresetField select {
+  min-width: 220px;
+  max-width: 300px;
+}
+
 /* Full-bar matrix (uniform column gap) + TRANSLATING (see HeaderMatrixOverlay) */
 .headerMatrixFx {
   position: absolute;
@@ -1047,11 +1059,46 @@ body {
   font-weight: 650;
 }
 
+.trainModalHint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.trainPresetRow {
+  display: grid;
+  grid-template-columns: minmax(180px, 220px) 1fr auto auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.trainPresetSelect {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.trainPresetSelect select {
+  width: 100%;
+}
+
+.trainPresetInput {
+  max-width: none;
+  width: 100%;
+}
+
 .trainModalAddRow {
   display: grid;
   grid-template-columns: 1fr 1fr auto;
   gap: 8px;
   align-items: center;
+}
+
+.trainModalSearchRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .trainInput {

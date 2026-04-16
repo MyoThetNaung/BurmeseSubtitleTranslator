@@ -18,6 +18,12 @@ export interface TranslationMemoryEntry {
   target: string
 }
 
+export interface TranslationPreset {
+  id: string
+  name: string
+  memory: TranslationMemoryEntry[]
+}
+
 /** OpenAI cloud tier: normal (GPT-5 mini) vs premium (GPT-5). */
 export type OpenAiTier = 'normal' | 'premium'
 
@@ -34,6 +40,10 @@ export interface AppConfig {
   cloudTargetLanguage?: TranslationLanguage
   /** User-taught phrase/sentence memory used to steer future translations. */
   translationMemory?: TranslationMemoryEntry[]
+  /** Named training presets (e.g., Harry Potter glossary). */
+  translationPresets?: TranslationPreset[]
+  /** Active preset used for translation memory. */
+  activeTranslationPresetId?: string
 }
 
 /** Safe subset from `config:get` (no plaintext API keys). */
@@ -49,6 +59,8 @@ export interface RendererConfig {
   openaiTier: OpenAiTier
   cloudTargetLanguage: TranslationLanguage
   translationMemory: TranslationMemoryEntry[]
+  translationPresets: TranslationPreset[]
+  activeTranslationPresetId: string
 }
 
 /** Saved session for continuing translation/editing later (.bsw JSON). */
@@ -71,4 +83,8 @@ export interface SubtitleWorkspace {
   cloudTargetLanguage?: TranslationLanguage
   /** Optional memory snapshot for this workspace. */
   translationMemory?: TranslationMemoryEntry[]
+  /** Optional preset snapshot list for sequel-specific memory. */
+  translationPresets?: TranslationPreset[]
+  /** Optional selected preset id for this workspace. */
+  activeTranslationPresetId?: string
 }

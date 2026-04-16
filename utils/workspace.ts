@@ -4,6 +4,7 @@ import type {
   SubtitleWorkspace,
   TranslationLanguage,
   TranslationMemoryEntry,
+  TranslationPreset,
 } from './types'
 
 function isCue(x: unknown): x is SubtitleCue {
@@ -24,6 +25,17 @@ function isTranslationMemoryEntry(x: unknown): x is TranslationMemoryEntry {
   if (!x || typeof x !== 'object') return false
   const o = x as Record<string, unknown>
   return typeof o.source === 'string' && typeof o.target === 'string'
+}
+
+function isTranslationPreset(x: unknown): x is TranslationPreset {
+  if (!x || typeof x !== 'object') return false
+  const o = x as Record<string, unknown>
+  return (
+    typeof o.id === 'string' &&
+    typeof o.name === 'string' &&
+    Array.isArray(o.memory) &&
+    o.memory.every(isTranslationMemoryEntry)
+  )
 }
 
 /**
@@ -97,6 +109,26 @@ export function parseWorkspaceJson(text: string): SubtitleWorkspace {
       }))
       .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
   }
+  let translationPresets: TranslationPreset[] | undefined
+  if (Array.isArray(o.translationPresets) && o.translationPresets.every(isTranslationPreset)) {
+    translationPresets = o.translationPresets
+      .map((preset) => ({
+        id: preset.id.trim(),
+        name: preset.name.trim(),
+        memory: preset.memory
+          .map((entry) => ({
+            source: entry.source.trim(),
+            target: entry.target.trim(),
+          }))
+          .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
+          .slice(0, 500),
+      }))
+      .filter((preset) => preset.id.length > 0 && preset.name.length > 0)
+  }
+  const activeTranslationPresetId =
+    typeof o.activeTranslationPresetId === 'string' && o.activeTranslationPresetId.trim().length > 0
+      ? o.activeTranslationPresetId.trim()
+      : undefined
 
   const savedAt = typeof o.savedAt === 'string' ? o.savedAt : new Date().toISOString()
   const sourceFileLabel = typeof o.sourceFileLabel === 'string' ? o.sourceFileLabel : ''
@@ -116,5 +148,7 @@ export function parseWorkspaceJson(text: string): SubtitleWorkspace {
     ...(openaiTier !== undefined ? { openaiTier } : {}),
     ...(cloudTargetLanguage !== undefined ? { cloudTargetLanguage } : {}),
     ...(translationMemory !== undefined ? { translationMemory } : {}),
+    ...(translationPresets !== undefined ? { translationPresets } : {}),
+    ...(activeTranslationPresetId !== undefined ? { activeTranslationPresetId } : {}),
   }
 }

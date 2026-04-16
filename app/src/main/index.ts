@@ -11,6 +11,7 @@ import type {
   OpenAiTier,
   TranslationLanguage,
   TranslationMemoryEntry,
+  TranslationPreset,
 } from '@utils/types'
 import { parseSrt, serializeSrt } from '@utils/index'
 import { LlamaServerManager } from './llamaServer'
@@ -133,16 +134,68 @@ async function firstRunFlow(): Promise<void> {
 }
 
 function registerIpc(): void {
+  const cleanTranslationMemory = (memory: TranslationMemoryEntry[]): TranslationMemoryEntry[] => {
+    return memory
+      .map((entry) => ({
+        source: typeof entry?.source === 'string' ? entry.source.trim() : '',
+        target: typeof entry?.target === 'string' ? entry.target.trim() : '',
+      }))
+      .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
+      .slice(0, 500)
+  }
+
+  const ensurePresetId = (raw: string): string => {
+    const safe = raw.trim().replace(/[^a-z0-9_-]+/gi, '-')
+    return safe.length > 0 ? safe.slice(0, 60) : `preset-${Date.now()}`
+  }
+
+  const readTranslationPresets = (): TranslationPreset[] => {
+    const raw = store.get('translationPresets')
+    if (!Array.isArray(raw) || raw.length === 0) {
+      const legacyMemory = Array.isArray(store.get('translationMemory'))
+        ? cleanTranslationMemory(store.get('translationMemory') as TranslationMemoryEntry[])
+        : []
+      return [{ id: 'default', name: 'Default', memory: legacyMemory }]
+    }
+    const byId = new Map<string, TranslationPreset>()
+    for (const entry of raw as TranslationPreset[]) {
+      const id = ensurePresetId(typeof entry?.id === 'string' ? entry.id : '')
+      const name = typeof entry?.name === 'string' ? entry.name.trim() : ''
+      if (!id || !name) continue
+      byId.set(id, {
+        id,
+        name: name.slice(0, 60),
+        memory: cleanTranslationMemory(Array.isArray(entry.memory) ? entry.memory : []),
+      })
+    }
+    const presets = [...byId.values()]
+    if (presets.length > 0) return presets
+    return [{ id: 'default', name: 'Default', memory: [] }]
+  }
+
+  const activePresetId = (presets: TranslationPreset[]): string => {
+    const raw = store.get('activeTranslationPresetId')
+    if (typeof raw === 'string' && presets.some((preset) => preset.id === raw)) {
+      return raw
+    }
+    return presets[0]?.id ?? 'default'
+  }
+
   const readTranslationMemory = (): TranslationMemoryEntry[] => {
-    return Array.isArray(store.get('translationMemory'))
-      ? (store.get('translationMemory') as TranslationMemoryEntry[])
-          .map((entry) => ({
-            source: typeof entry?.source === 'string' ? entry.source.trim() : '',
-            target: typeof entry?.target === 'string' ? entry.target.trim() : '',
-          }))
-          .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
-          .slice(0, 500)
-      : []
+    const presets = readTranslationPresets()
+    const activeId = activePresetId(presets)
+    return presets.find((preset) => preset.id === activeId)?.memory ?? []
+  }
+
+  const writePresetsAndActive = (presets: TranslationPreset[], activeId: string): void => {
+    const safePresets = presets.length ? presets : [{ id: 'default', name: 'Default', memory: [] }]
+    const safeActive = safePresets.some((preset) => preset.id === activeId)
+      ? activeId
+      : safePresets[0].id
+    store.set('translationPresets', safePresets)
+    store.set('activeTranslationPresetId', safeActive)
+    const activeMemory = safePresets.find((preset) => preset.id === safeActive)?.memory ?? []
+    store.set('translationMemory', activeMemory)
   }
 
   const mergeTranslationMemory = (
@@ -176,7 +229,11 @@ function registerIpc(): void {
     const openaiTier: OpenAiTier = store.get('openaiTier') === 'premium' ? 'premium' : 'normal'
     const cloudTargetLanguage: TranslationLanguage =
       store.get('cloudTargetLanguage') === 'thai' ? 'thai' : 'myanmar'
-    const translationMemory = readTranslationMemory()
+    const translationPresets = readTranslationPresets()
+    const activeTranslationPresetId = activePresetId(translationPresets)
+    const translationMemory =
+      translationPresets.find((preset) => preset.id === activeTranslationPresetId)?.memory ?? []
+    writePresetsAndActive(translationPresets, activeTranslationPresetId)
     return {
       selectedModel: safeModel,
       modelsDir: store.get('modelsDir') ?? null,
@@ -189,6 +246,8 @@ function registerIpc(): void {
       openaiTier,
       cloudTargetLanguage,
       translationMemory,
+      translationPresets,
+      activeTranslationPresetId,
     }
   })
 
@@ -219,14 +278,36 @@ function registerIpc(): void {
         store.set('cloudTargetLanguage', partial.cloudTargetLanguage)
       }
       if (Array.isArray(partial.translationMemory)) {
-        const cleaned = (partial.translationMemory as TranslationMemoryEntry[])
-          .map((entry) => ({
-            source: typeof entry?.source === 'string' ? entry.source.trim() : '',
-            target: typeof entry?.target === 'string' ? entry.target.trim() : '',
-          }))
-          .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
-          .slice(0, 500)
-        store.set('translationMemory', cleaned)
+        const presets = readTranslationPresets()
+        const activeId = activePresetId(presets)
+        const cleaned = cleanTranslationMemory(partial.translationMemory as TranslationMemoryEntry[])
+        writePresetsAndActive(
+          presets.map((preset) => (preset.id === activeId ? { ...preset, memory: cleaned } : preset)),
+          activeId,
+        )
+      }
+      if (Array.isArray((partial as AppConfig).translationPresets)) {
+        const incoming = (partial as AppConfig).translationPresets as TranslationPreset[]
+        const byId = new Map<string, TranslationPreset>()
+        for (const preset of incoming) {
+          const id = ensurePresetId(typeof preset?.id === 'string' ? preset.id : '')
+          const name = typeof preset?.name === 'string' ? preset.name.trim() : ''
+          if (!id || !name) continue
+          byId.set(id, {
+            id,
+            name: name.slice(0, 60),
+            memory: cleanTranslationMemory(Array.isArray(preset.memory) ? preset.memory : []),
+          })
+        }
+        const presets = [...byId.values()]
+        const requestedActiveId =
+          typeof (partial as AppConfig).activeTranslationPresetId === 'string'
+            ? ensurePresetId((partial as AppConfig).activeTranslationPresetId ?? '')
+            : activePresetId(presets)
+        writePresetsAndActive(presets, requestedActiveId)
+      } else if (typeof (partial as AppConfig).activeTranslationPresetId === 'string') {
+        const presets = readTranslationPresets()
+        writePresetsAndActive(presets, ensurePresetId((partial as AppConfig).activeTranslationPresetId ?? ''))
       }
       if (partial.modelsDir !== undefined) store.set('modelsDir', partial.modelsDir)
       if (typeof partial.nGpuLayers === 'number' && partial.nGpuLayers >= 0) {
@@ -362,14 +443,15 @@ function registerIpc(): void {
             : 'myanmar'
       store.set('cloudTargetLanguage', targetLanguage)
       if (Array.isArray(payload.translationMemory)) {
-        const cleanedPayloadMemory = payload.translationMemory
-          .map((entry) => ({
-            source: typeof entry?.source === 'string' ? entry.source.trim() : '',
-            target: typeof entry?.target === 'string' ? entry.target.trim() : '',
-          }))
-          .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
-          .slice(0, 500)
-        store.set('translationMemory', cleanedPayloadMemory)
+        const presets = readTranslationPresets()
+        const activeId = activePresetId(presets)
+        const cleanedPayloadMemory = cleanTranslationMemory(payload.translationMemory)
+        writePresetsAndActive(
+          presets.map((preset) =>
+            preset.id === activeId ? { ...preset, memory: cleanedPayloadMemory } : preset,
+          ),
+          activeId,
+        )
       }
       const translationMemory = readTranslationMemory()
 
@@ -390,7 +472,13 @@ function registerIpc(): void {
           target: cue.text.trim(),
         }))
         .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
-      store.set('translationMemory', mergeTranslationMemory(translationMemory, learnedPairs))
+      const mergedMemory = mergeTranslationMemory(translationMemory, learnedPairs)
+      const presets = readTranslationPresets()
+      const activeId = activePresetId(presets)
+      writePresetsAndActive(
+        presets.map((preset) => (preset.id === activeId ? { ...preset, memory: mergedMemory } : preset)),
+        activeId,
+      )
       return result
     },
   )
@@ -435,14 +523,15 @@ function registerIpc(): void {
             : 'myanmar'
       store.set('cloudTargetLanguage', targetLanguage)
       if (Array.isArray(payload.translationMemory)) {
-        const cleanedPayloadMemory = payload.translationMemory
-          .map((entry) => ({
-            source: typeof entry?.source === 'string' ? entry.source.trim() : '',
-            target: typeof entry?.target === 'string' ? entry.target.trim() : '',
-          }))
-          .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
-          .slice(0, 500)
-        store.set('translationMemory', cleanedPayloadMemory)
+        const presets = readTranslationPresets()
+        const activeId = activePresetId(presets)
+        const cleanedPayloadMemory = cleanTranslationMemory(payload.translationMemory)
+        writePresetsAndActive(
+          presets.map((preset) =>
+            preset.id === activeId ? { ...preset, memory: cleanedPayloadMemory } : preset,
+          ),
+          activeId,
+        )
       }
       const translationMemory = readTranslationMemory()
 
@@ -458,11 +547,14 @@ function registerIpc(): void {
         translationMemory,
       })
       if (payload.cue.text.trim() && result.trim()) {
-        store.set(
-          'translationMemory',
-          mergeTranslationMemory(translationMemory, [
-            { source: payload.cue.text.trim(), target: result.trim() },
-          ]),
+        const merged = mergeTranslationMemory(translationMemory, [
+          { source: payload.cue.text.trim(), target: result.trim() },
+        ])
+        const presets = readTranslationPresets()
+        const activeId = activePresetId(presets)
+        writePresetsAndActive(
+          presets.map((preset) => (preset.id === activeId ? { ...preset, memory: merged } : preset)),
+          activeId,
         )
       }
       return result

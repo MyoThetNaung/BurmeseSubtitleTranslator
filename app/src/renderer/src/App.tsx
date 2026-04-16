@@ -7,6 +7,7 @@ import type {
   SubtitleWorkspace,
   TranslationLanguage,
   TranslationMemoryEntry,
+  TranslationPreset,
 } from '@utils/types'
 import { AnimatedLogo } from './components/AnimatedLogo'
 import { HeaderMatrixOverlay } from './components/HeaderMatrixOverlay'
@@ -44,6 +45,46 @@ function replaceAllInString(
   }
 }
 
+function cleanMemory(memory: TranslationMemoryEntry[]): TranslationMemoryEntry[] {
+  return memory
+    .map((entry) => ({ source: entry.source.trim(), target: entry.target.trim() }))
+    .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
+    .slice(0, 500)
+}
+
+function mergeMemory(base: TranslationMemoryEntry[], extra: TranslationMemoryEntry[]): TranslationMemoryEntry[] {
+  const bySource = new Map<string, TranslationMemoryEntry>()
+  for (const entry of base) {
+    const source = entry.source.trim()
+    const target = entry.target.trim()
+    if (!source || !target) continue
+    bySource.set(source.toLowerCase(), { source, target })
+  }
+  for (const entry of extra) {
+    const source = entry.source.trim()
+    const target = entry.target.trim()
+    if (!source || !target) continue
+    bySource.set(source.toLowerCase(), { source, target })
+  }
+  return [...bySource.values()].slice(0, 500)
+}
+
+function cleanPresets(
+  presets: TranslationPreset[],
+  fallbackMemory: TranslationMemoryEntry[],
+): TranslationPreset[] {
+  const byId = new Map<string, TranslationPreset>()
+  for (const preset of presets) {
+    const id = (preset.id ?? '').trim()
+    const name = (preset.name ?? '').trim()
+    if (!id || !name) continue
+    byId.set(id, { id, name: name.slice(0, 60), memory: cleanMemory(preset.memory ?? []) })
+  }
+  const next = [...byId.values()]
+  if (next.length > 0) return next
+  return [{ id: 'default', name: 'Default', memory: cleanMemory(fallbackMemory) }]
+}
+
 export function App(): JSX.Element {
   const [cues, setCues] = useState<SubtitleCue[]>([])
   const [translated, setTranslated] = useState<SubtitleCue[] | null>(null)
@@ -70,8 +111,19 @@ export function App(): JSX.Element {
   const [openAiTier, setOpenAiTier] = useState<OpenAiTier>('normal')
   const [cloudTargetLanguage, setCloudTargetLanguage] = useState<TranslationLanguage>('myanmar')
   const [translationMemory, setTranslationMemory] = useState<TranslationMemoryEntry[]>([])
+  const [translationPresets, setTranslationPresets] = useState<TranslationPreset[]>([])
+  const [activeTranslationPresetId, setActiveTranslationPresetId] = useState('default')
+  const [memoryDataPresets, setMemoryDataPresets] = useState<TranslationPreset[]>([
+    { id: 'default', name: 'Default', memory: [] },
+  ])
+  const [activeMemoryDataPresetId, setActiveMemoryDataPresetId] = useState('default')
+  const [selectedSequelPresetId, setSelectedSequelPresetId] = useState<string>('default')
   const [trainWindowOpen, setTrainWindowOpen] = useState(false)
+  const [memoryWindowOpen, setMemoryWindowOpen] = useState(false)
   const [trainDirty, setTrainDirty] = useState(false)
+  const [memoryDataDirty, setMemoryDataDirty] = useState(false)
+  const [memorySearchText, setMemorySearchText] = useState('')
+  const [presetNameDraft, setPresetNameDraft] = useState('')
   const [memorySourceDraft, setMemorySourceDraft] = useState('')
   const [memoryTargetDraft, setMemoryTargetDraft] = useState('')
   const [memoryHint, setMemoryHint] = useState<string | null>(null)
@@ -95,7 +147,14 @@ export function App(): JSX.Element {
         setOpenaiApiKeyConfigured(cfg.openaiApiKeyConfigured)
         setOpenAiTier(cfg.openaiTier)
         setCloudTargetLanguage(cfg.cloudTargetLanguage)
-        setTranslationMemory(cfg.translationMemory ?? [])
+        const safePresets = cleanPresets(cfg.translationPresets ?? [], cfg.translationMemory ?? [])
+        const safeActiveId = safePresets.some((preset) => preset.id === cfg.activeTranslationPresetId)
+          ? cfg.activeTranslationPresetId
+          : safePresets[0].id
+        setTranslationPresets(safePresets)
+        setActiveTranslationPresetId(safeActiveId)
+        setSelectedSequelPresetId('default')
+        setTranslationMemory(safePresets.find((preset) => preset.id === safeActiveId)?.memory ?? [])
         setTrainDirty(false)
         if (cfg.inferenceMode === 'cpu' || cfg.inferenceMode === 'gpu') {
           setInferenceMode(cfg.inferenceMode)
@@ -107,6 +166,19 @@ export function App(): JSX.Element {
       }
     })()
   }, [api])
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('subtitle.memoryDataPresets.v1')
+      if (!raw) return
+      const parsed = JSON.parse(raw) as TranslationPreset[]
+      const safe = cleanPresets(parsed, [])
+      setMemoryDataPresets(safe)
+      setActiveMemoryDataPresetId((prev) => (safe.some((preset) => preset.id === prev) ? prev : safe[0].id))
+    } catch {
+      /* ignore malformed local cache */
+    }
+  }, [])
 
   useEffect(() => {
     if (model === 'gemini') setCloudSettingsTab('gemini')
@@ -221,6 +293,119 @@ export function App(): JSX.Element {
     [api],
   )
 
+  const persistPresets = useCallback(
+    async (presets: TranslationPreset[], activeId: string) => {
+      const safe = cleanPresets(presets, [])
+      const safeActive = safe.some((preset) => preset.id === activeId) ? activeId : safe[0].id
+      setTranslationPresets(safe)
+      setActiveTranslationPresetId(safeActive)
+      setTranslationMemory(safe.find((preset) => preset.id === safeActive)?.memory ?? [])
+      await api.setConfig({ translationPresets: safe, activeTranslationPresetId: safeActive })
+    },
+    [api],
+  )
+
+  const persistMemoryDataPresets = useCallback((presets: TranslationPreset[], activeId: string) => {
+    const safe = cleanPresets(presets, [])
+    const safeActive = safe.some((preset) => preset.id === activeId) ? activeId : safe[0].id
+    setMemoryDataPresets(safe)
+    setActiveMemoryDataPresetId(safeActive)
+    localStorage.setItem('subtitle.memoryDataPresets.v1', JSON.stringify(safe))
+  }, [])
+
+  const onActivePresetChange = useCallback(
+    async (presetId: string) => {
+      setMemoryHint(null)
+      setTrainDirty(false)
+      await persistPresets(translationPresets, presetId)
+    },
+    [persistPresets, translationPresets],
+  )
+
+  const onSequelPresetChange = useCallback((presetId: string) => {
+    setSelectedSequelPresetId(presetId)
+  }, [])
+
+  const onActiveMemoryDataPresetChange = useCallback(
+    (presetId: string) => {
+      setMemoryHint(null)
+      setMemoryDataDirty(false)
+      const active = memoryDataPresets.find((preset) => preset.id === presetId)
+      if (!active) return
+      setActiveMemoryDataPresetId(active.id)
+    },
+    [memoryDataPresets],
+  )
+
+  const onCreatePreset = useCallback(async () => {
+    const name = presetNameDraft.trim()
+    if (!name) {
+      setMemoryHint('Enter a preset name, e.g. Harry Potter.')
+      return
+    }
+    const idBase = name.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '')
+    const idSeed = idBase || `preset-${Date.now()}`
+    let uniqueId = idSeed
+    let suffix = 2
+    while (translationPresets.some((preset) => preset.id === uniqueId)) {
+      uniqueId = `${idSeed}-${suffix}`
+      suffix += 1
+    }
+    const nextPresets = [...translationPresets, { id: uniqueId, name: name.slice(0, 60), memory: [] }]
+    setPresetNameDraft('')
+    setMemoryHint(`Preset "${name}" created.`)
+    setTrainDirty(false)
+    await persistPresets(nextPresets, uniqueId)
+  }, [persistPresets, presetNameDraft, translationPresets])
+
+  const onDeletePreset = useCallback(async () => {
+    if (translationPresets.length <= 1) {
+      setMemoryHint('At least one preset is required.')
+      return
+    }
+    const target = translationPresets.find((preset) => preset.id === activeTranslationPresetId)
+    if (!target) return
+    const nextPresets = translationPresets.filter((preset) => preset.id !== activeTranslationPresetId)
+    const nextActive = nextPresets[0]?.id ?? 'default'
+    setMemoryHint(`Preset "${target.name}" removed.`)
+    setTrainDirty(false)
+    await persistPresets(nextPresets, nextActive)
+  }, [activeTranslationPresetId, persistPresets, translationPresets])
+
+  const onCreateMemoryDataPreset = useCallback(() => {
+    const name = presetNameDraft.trim()
+    if (!name) {
+      setMemoryHint('Enter a preset name, e.g. Harry Potter.')
+      return
+    }
+    const idBase = name.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '')
+    const idSeed = idBase || `preset-${Date.now()}`
+    let uniqueId = idSeed
+    let suffix = 2
+    while (memoryDataPresets.some((preset) => preset.id === uniqueId)) {
+      uniqueId = `${idSeed}-${suffix}`
+      suffix += 1
+    }
+    persistMemoryDataPresets(
+      [...memoryDataPresets, { id: uniqueId, name: name.slice(0, 60), memory: [] }],
+      uniqueId,
+    )
+    setPresetNameDraft('')
+    setMemoryHint(`Memory preset "${name}" created.`)
+  }, [memoryDataPresets, persistMemoryDataPresets, presetNameDraft])
+
+  const onDeleteMemoryDataPreset = useCallback(() => {
+    if (memoryDataPresets.length <= 1) {
+      setMemoryHint('At least one memory preset is required.')
+      return
+    }
+    const target = memoryDataPresets.find((preset) => preset.id === activeMemoryDataPresetId)
+    if (!target) return
+    const next = memoryDataPresets.filter((preset) => preset.id !== activeMemoryDataPresetId)
+    persistMemoryDataPresets(next, next[0]?.id ?? 'default')
+    setMemoryHint(`Memory preset "${target.name}" removed.`)
+  }, [activeMemoryDataPresetId, memoryDataPresets, persistMemoryDataPresets])
+
   const onAddTranslationMemory = useCallback(async () => {
     const source = memorySourceDraft.trim()
     const target = memoryTargetDraft.trim()
@@ -228,29 +413,42 @@ export function App(): JSX.Element {
       setMemoryHint('Enter both source phrase and preferred translation.')
       return
     }
-    const next = [...translationMemory.filter((entry) => entry.source !== source), { source, target }]
-    setTranslationMemory(next)
+    const nextMemory = [...translationMemory.filter((entry) => entry.source !== source), { source, target }]
+    const nextPresets = translationPresets.map((preset) =>
+      preset.id === activeTranslationPresetId ? { ...preset, memory: nextMemory } : preset,
+    )
     setMemorySourceDraft('')
     setMemoryTargetDraft('')
     setMemoryHint('Saved in memory.')
     setTrainDirty(false)
-    await api.setConfig({ translationMemory: next })
-  }, [api, memorySourceDraft, memoryTargetDraft, translationMemory])
+    await persistPresets(nextPresets, activeTranslationPresetId)
+  }, [
+    activeTranslationPresetId,
+    memorySourceDraft,
+    memoryTargetDraft,
+    persistPresets,
+    translationMemory,
+    translationPresets,
+  ])
 
   const onDeleteTranslationMemory = useCallback(
     async (idx: number) => {
-      const next = translationMemory.filter((_, i) => i !== idx)
-      setTranslationMemory(next)
+      const nextMemory = translationMemory.filter((_, i) => i !== idx)
+      const nextPresets = translationPresets.map((preset) =>
+        preset.id === activeTranslationPresetId ? { ...preset, memory: nextMemory } : preset,
+      )
       setMemoryHint('Removed from memory.')
       setTrainDirty(false)
-      await api.setConfig({ translationMemory: next })
+      await persistPresets(nextPresets, activeTranslationPresetId)
     },
-    [api, translationMemory],
+    [activeTranslationPresetId, persistPresets, translationMemory, translationPresets],
   )
 
   const onMemoryEntryChange = useCallback(
     (idx: number, field: 'source' | 'target', value: string) => {
-      setTranslationMemory((prev) => prev.map((entry, i) => (i === idx ? { ...entry, [field]: value } : entry)))
+      setTranslationMemory((prev) =>
+        prev.map((entry, i) => (i === idx ? { ...entry, [field]: value } : entry)),
+      )
       setTrainDirty(true)
       setMemoryHint(null)
     },
@@ -258,18 +456,174 @@ export function App(): JSX.Element {
   )
 
   const onSaveTrainingMemory = useCallback(async () => {
-    const cleaned = translationMemory
-      .map((entry) => ({ source: entry.source.trim(), target: entry.target.trim() }))
-      .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
-    setTranslationMemory(cleaned)
-    await api.setConfig({ translationMemory: cleaned })
+    const cleaned = cleanMemory(translationMemory)
+    const nextPresets = translationPresets.map((preset) =>
+      preset.id === activeTranslationPresetId ? { ...preset, memory: cleaned } : preset,
+    )
+    await persistPresets(nextPresets, activeTranslationPresetId)
     setTrainDirty(false)
     setMemoryHint('Training data saved.')
-  }, [api, translationMemory])
+  }, [activeTranslationPresetId, persistPresets, translationMemory, translationPresets])
+
+  const onAddMemoryDataEntry = useCallback(() => {
+    const source = memorySourceDraft.trim()
+    const target = memoryTargetDraft.trim()
+    if (!source || !target) {
+      setMemoryHint('Enter both source phrase and preferred translation.')
+      return
+    }
+    const nextPresets = memoryDataPresets.map((preset) =>
+      preset.id === activeMemoryDataPresetId
+        ? {
+            ...preset,
+            memory: [...preset.memory.filter((entry) => entry.source !== source), { source, target }],
+          }
+        : preset,
+    )
+    persistMemoryDataPresets(nextPresets, activeMemoryDataPresetId)
+    setMemorySourceDraft('')
+    setMemoryTargetDraft('')
+    setMemoryHint('Saved in memory data.')
+    setMemoryDataDirty(false)
+  }, [
+    activeMemoryDataPresetId,
+    memoryDataPresets,
+    memorySourceDraft,
+    memoryTargetDraft,
+    persistMemoryDataPresets,
+  ])
+
+  const onDeleteMemoryDataEntry = useCallback(
+    (idx: number) => {
+      const nextPresets = memoryDataPresets.map((preset) =>
+        preset.id === activeMemoryDataPresetId
+          ? { ...preset, memory: preset.memory.filter((_, i) => i !== idx) }
+          : preset,
+      )
+      persistMemoryDataPresets(nextPresets, activeMemoryDataPresetId)
+      setMemoryDataDirty(false)
+      setMemoryHint('Removed from memory data.')
+    },
+    [activeMemoryDataPresetId, memoryDataPresets, persistMemoryDataPresets],
+  )
+
+  const onMemoryDataEntryChange = useCallback(
+    (idx: number, field: 'source' | 'target', value: string) => {
+      setMemoryDataPresets((prev) =>
+        prev.map((preset) =>
+          preset.id === activeMemoryDataPresetId
+            ? {
+                ...preset,
+                memory: preset.memory.map((entry, i) => (i === idx ? { ...entry, [field]: value } : entry)),
+              }
+            : preset,
+        ),
+      )
+      setMemoryDataDirty(true)
+      setMemoryHint(null)
+    },
+    [activeMemoryDataPresetId],
+  )
+
+  const onSaveMemoryDataChanges = useCallback(() => {
+    const cleaned = memoryDataPresets.map((preset) =>
+      preset.id === activeMemoryDataPresetId ? { ...preset, memory: cleanMemory(preset.memory) } : preset,
+    )
+    persistMemoryDataPresets(cleaned, activeMemoryDataPresetId)
+    setMemoryDataDirty(false)
+    setMemoryHint('Memory data saved.')
+  }, [activeMemoryDataPresetId, memoryDataPresets, persistMemoryDataPresets])
 
   const onStopTranslate = useCallback(() => {
     void api.cancelTranslate()
   }, [api])
+
+  const effectiveTranslationMemory = useMemo(() => {
+    const trainDefault = translationPresets.find((preset) => preset.id === 'default')?.memory ?? []
+    const memoryDefault = memoryDataPresets.find((preset) => preset.id === 'default')?.memory ?? []
+    const defaultMemory = mergeMemory(trainDefault, memoryDefault)
+    if (!selectedSequelPresetId || selectedSequelPresetId === 'default') return defaultMemory
+    const sequelTrain = translationPresets.find((preset) => preset.id === selectedSequelPresetId)?.memory ?? []
+    const sequelData = memoryDataPresets.find((preset) => preset.id === selectedSequelPresetId)?.memory ?? []
+    const sequelMemory = mergeMemory(sequelTrain, sequelData)
+    const merged = new Map<string, TranslationMemoryEntry>()
+    for (const entry of defaultMemory) {
+      const key = entry.source.trim().toLowerCase()
+      if (!key) continue
+      merged.set(key, { source: entry.source.trim(), target: entry.target.trim() })
+    }
+    for (const entry of sequelMemory) {
+      const key = entry.source.trim().toLowerCase()
+      if (!key) continue
+      // Sequel-specific vocabulary overrides default if same source appears.
+      merged.set(key, { source: entry.source.trim(), target: entry.target.trim() })
+    }
+    return [...merged.values()]
+  }, [selectedSequelPresetId, translationPresets, memoryDataPresets])
+
+  const availableSequelPresets = useMemo(() => {
+    const byId = new Map<string, string>()
+    for (const preset of translationPresets) {
+      if (preset.id === 'default') continue
+      byId.set(preset.id, preset.name)
+    }
+    for (const preset of memoryDataPresets) {
+      if (preset.id === 'default') continue
+      if (!byId.has(preset.id)) byId.set(preset.id, preset.name)
+    }
+    return [...byId.entries()].map(([id, name]) => ({ id, name }))
+  }, [translationPresets, memoryDataPresets])
+
+  const filteredTranslationMemory = useMemo(() => {
+    const needle = memorySearchText.trim().toLowerCase()
+    if (!needle) return translationMemory
+    return translationMemory.filter(
+      (entry) => entry.source.toLowerCase().includes(needle) || entry.target.toLowerCase().includes(needle),
+    )
+  }, [memorySearchText, translationMemory])
+
+  const activeMemoryData = useMemo(
+    () => memoryDataPresets.find((preset) => preset.id === activeMemoryDataPresetId)?.memory ?? [],
+    [activeMemoryDataPresetId, memoryDataPresets],
+  )
+
+  const filteredMemoryData = useMemo(() => {
+    const needle = memorySearchText.trim().toLowerCase()
+    if (!needle) return activeMemoryData
+    return activeMemoryData.filter(
+      (entry) => entry.source.toLowerCase().includes(needle) || entry.target.toLowerCase().includes(needle),
+    )
+  }, [activeMemoryData, memorySearchText])
+
+  const onSaveExportedTranslationMemory = useCallback(
+    async (sourceCues: SubtitleCue[], translatedCues: SubtitleCue[]) => {
+      const learnedPairs = translatedCues
+        .map((cue, idx) => ({
+          source: sourceCues[idx]?.text?.trim() ?? '',
+          target: cue.text.trim(),
+        }))
+        .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
+      if (!learnedPairs.length) return
+
+      const nextPresets = memoryDataPresets.map((preset) => {
+        if (preset.id === 'default') {
+          return { ...preset, memory: mergeMemory(preset.memory, learnedPairs) }
+        }
+        if (selectedSequelPresetId !== 'default' && preset.id === selectedSequelPresetId) {
+          return { ...preset, memory: mergeMemory(preset.memory, learnedPairs) }
+        }
+        return preset
+      })
+
+      persistMemoryDataPresets(nextPresets, activeMemoryDataPresetId)
+      const targetLabel =
+        selectedSequelPresetId === 'default'
+          ? 'Default memory'
+          : 'Default + selected sequel preset memory'
+      setMemoryHint(`Saved ${learnedPairs.length} translated lines to ${targetLabel}.`)
+    },
+    [activeMemoryDataPresetId, memoryDataPresets, persistMemoryDataPresets, selectedSequelPresetId],
+  )
 
   const onTranslate = useCallback(async () => {
     if (!cues.length) return
@@ -282,7 +636,7 @@ export function App(): JSX.Element {
         cues,
         modelKey: model,
         targetLanguage: cloudTargetLanguage,
-        translationMemory,
+        translationMemory: effectiveTranslationMemory,
       })
       setTranslated(out)
       setProgress(100)
@@ -293,7 +647,7 @@ export function App(): JSX.Element {
     } finally {
       setBusy(false)
     }
-  }, [api, cues, model, cloudTargetLanguage, translationMemory])
+  }, [api, cues, model, cloudTargetLanguage, effectiveTranslationMemory])
 
   const onOriginalCueTextChange = useCallback((idx: number, text: string) => {
     setCues((prev) => prev.map((c, i) => (i === idx ? { ...c, text } : c)))
@@ -376,7 +730,8 @@ export function App(): JSX.Element {
     if (!path) return
     const data = await api.serializeSubtitle(src)
     await api.writeUtf8File(path, data)
-  }, [api, translated, fileLabel, model, cloudTargetLanguage])
+    await onSaveExportedTranslationMemory(cues, src)
+  }, [api, translated, fileLabel, model, cloudTargetLanguage, onSaveExportedTranslationMemory, cues])
 
   const onRetranslateLine = useCallback(
     async (idx: number) => {
@@ -389,7 +744,7 @@ export function App(): JSX.Element {
           cue,
           modelKey: model,
           targetLanguage: cloudTargetLanguage,
-          translationMemory,
+          translationMemory: effectiveTranslationMemory,
         })
         if (newText === cue.text) {
           return
@@ -406,7 +761,7 @@ export function App(): JSX.Element {
         setRetranslatingIdx(null)
       }
     },
-    [api, busy, cues, model, retranslatingIdx, cloudTargetLanguage, translationMemory],
+    [api, busy, cues, model, retranslatingIdx, cloudTargetLanguage, effectiveTranslationMemory],
   )
 
   const onSaveOriginal = useCallback(async () => {
@@ -452,6 +807,8 @@ export function App(): JSX.Element {
         openaiTier: openAiTier,
         cloudTargetLanguage,
         translationMemory,
+        translationPresets,
+        activeTranslationPresetId,
       }
       await api.writeUtf8File(path, JSON.stringify(ws, null, 2))
       setWorkspaceHint(`Workspace saved. You can open this file later to continue editing.`)
@@ -472,6 +829,8 @@ export function App(): JSX.Element {
     openAiTier,
     cloudTargetLanguage,
     translationMemory,
+    translationPresets,
+    activeTranslationPresetId,
     defaultWorkspaceFileName,
   ])
 
@@ -494,9 +853,17 @@ export function App(): JSX.Element {
       setInferenceMode(ws.inferenceMode)
       const nextTier = ws.openaiTier ?? 'normal'
       const nextTargetLanguage = ws.cloudTargetLanguage ?? 'myanmar'
-      const nextTranslationMemory = ws.translationMemory ?? []
+      const nextPresets = cleanPresets(ws.translationPresets ?? [], ws.translationMemory ?? [])
+      const nextActivePresetId = nextPresets.some((preset) => preset.id === ws.activeTranslationPresetId)
+        ? ws.activeTranslationPresetId
+        : nextPresets[0].id
+      const nextTranslationMemory =
+        nextPresets.find((preset) => preset.id === nextActivePresetId)?.memory ?? []
       setOpenAiTier(nextTier)
       setCloudTargetLanguage(nextTargetLanguage)
+      setTranslationPresets(nextPresets)
+      setActiveTranslationPresetId(nextActivePresetId)
+      setSelectedSequelPresetId('default')
       setTranslationMemory(nextTranslationMemory)
       setTrainDirty(false)
       await api.setConfig({
@@ -505,6 +872,8 @@ export function App(): JSX.Element {
         openaiTier: nextTier,
         cloudTargetLanguage: nextTargetLanguage,
         translationMemory: nextTranslationMemory,
+        translationPresets: nextPresets,
+        activeTranslationPresetId: nextActivePresetId,
       })
       setWorkspaceHint(`Loaded workspace from ${r.filePath}`)
     } catch (e) {
@@ -733,20 +1102,49 @@ export function App(): JSX.Element {
 
       <nav className="menubar" aria-label="Main actions">
         <div className="controls">
+          <label className="field sequelPresetField">
+            <span>Sequel preset</span>
+            <select
+              value={selectedSequelPresetId}
+              disabled={busy}
+              onChange={(e) => onSequelPresetChange(e.target.value)}
+            >
+              <option value="default">None (Default always active)</option>
+              {availableSequelPresets.map((preset) => (
+                <option key={preset.id} value={preset.id}>
+                  {preset.name}
+                </option>
+              ))}
+            </select>
+          </label>
           <button type="button" className="btn" onClick={() => void onOpen()} disabled={busy}>
             Open .srt
           </button>
           <button
             type="button"
             className="btn"
-            title="Open training memory window"
+            title="Open train data editor"
             onClick={() => {
               setTrainWindowOpen(true)
+              setMemoryWindowOpen(false)
               setNavMenuOpen(false)
             }}
             disabled={busy}
           >
             Train
+          </button>
+          <button
+            type="button"
+            className="btn"
+            title="Open saved memory data editor"
+            onClick={() => {
+              setMemoryWindowOpen(true)
+              setTrainWindowOpen(false)
+              setNavMenuOpen(false)
+            }}
+            disabled={busy}
+          >
+            Memory Data
           </button>
           <button
             type="button"
@@ -987,9 +1385,47 @@ export function App(): JSX.Element {
         <div className="trainModalBackdrop" onClick={() => setTrainWindowOpen(false)}>
           <section className="trainModal" onClick={(e) => e.stopPropagation()}>
             <div className="trainModalHeader">
-              <div className="trainModalTitle">Translation Training Memory</div>
+              <div className="trainModalTitle">Train Data</div>
               <button type="button" className="btn" onClick={() => setTrainWindowOpen(false)}>
                 Close
+              </button>
+            </div>
+            <p className="trainModalHint">
+              Train data is your manual glossary and special sequel phrasing.
+            </p>
+
+            <div className="trainPresetRow">
+              <label className="field trainPresetSelect">
+                <span>Preset</span>
+                <select
+                  value={activeTranslationPresetId}
+                  onChange={(e) => void onActivePresetChange(e.target.value)}
+                >
+                  {translationPresets.map((preset) => (
+                    <option key={preset.id} value={preset.id}>
+                      {preset.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <input
+                type="text"
+                className="editInput trainPresetInput"
+                value={presetNameDraft}
+                onChange={(e) => setPresetNameDraft(e.target.value)}
+                placeholder="New preset name (e.g. Harry Potter)"
+                spellCheck={false}
+              />
+              <button type="button" className="btn" onClick={() => void onCreatePreset()}>
+                New preset
+              </button>
+              <button
+                type="button"
+                className="btn btnStop"
+                disabled={translationPresets.length <= 1}
+                onClick={() => void onDeletePreset()}
+              >
+                Delete preset
               </button>
             </div>
 
@@ -1020,14 +1456,28 @@ export function App(): JSX.Element {
               </button>
             </div>
 
+            <div className="trainModalSearchRow">
+              <input
+                type="text"
+                className="editInput trainInput"
+                value={memorySearchText}
+                onChange={(e) => setMemorySearchText(e.target.value)}
+                placeholder="Search saved data (English or translation)"
+                spellCheck={false}
+              />
+            </div>
+
             <div className="trainModalGridHead">
               <div>English</div>
               <div>Myanmar</div>
               <div>Action</div>
             </div>
             <div className="trainModalList">
-              {translationMemory.length ? (
-                translationMemory.map((entry, idx) => (
+              {filteredTranslationMemory.length ? (
+                filteredTranslationMemory.map((entry) => {
+                  const idx = translationMemory.indexOf(entry)
+                  if (idx < 0) return null
+                  return (
                   <div key={`${entry.source}-${idx}`} className="trainModalRow">
                     <textarea
                       className="cueTextarea trainTextarea"
@@ -1051,9 +1501,10 @@ export function App(): JSX.Element {
                       Remove
                     </button>
                   </div>
-                ))
+                  )
+                })
               ) : (
-                <div className="trainModalEmpty">No training data yet.</div>
+                <div className="trainModalEmpty">No saved data found for this preset.</div>
               )}
             </div>
 
@@ -1064,6 +1515,148 @@ export function App(): JSX.Element {
                 className="btn primary"
                 disabled={!trainDirty}
                 onClick={() => void onSaveTrainingMemory()}
+              >
+                Save changes
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {memoryWindowOpen ? (
+        <div className="trainModalBackdrop" onClick={() => setMemoryWindowOpen(false)}>
+          <section className="trainModal" onClick={(e) => e.stopPropagation()}>
+            <div className="trainModalHeader">
+              <div className="trainModalTitle">Memory Data</div>
+              <button type="button" className="btn" onClick={() => setMemoryWindowOpen(false)}>
+                Close
+              </button>
+            </div>
+            <p className="trainModalHint">
+              Memory data is auto-saved from exported translations and kept separate from train data.
+            </p>
+
+            <div className="trainPresetRow">
+              <label className="field trainPresetSelect">
+                <span>Preset</span>
+                <select
+                  value={activeMemoryDataPresetId}
+                  onChange={(e) => onActiveMemoryDataPresetChange(e.target.value)}
+                >
+                  {memoryDataPresets.map((preset) => (
+                    <option key={preset.id} value={preset.id}>
+                      {preset.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <input
+                type="text"
+                className="editInput trainPresetInput"
+                value={presetNameDraft}
+                onChange={(e) => setPresetNameDraft(e.target.value)}
+                placeholder="New memory preset name"
+                spellCheck={false}
+              />
+              <button type="button" className="btn" onClick={() => onCreateMemoryDataPreset()}>
+                New preset
+              </button>
+              <button
+                type="button"
+                className="btn btnStop"
+                disabled={memoryDataPresets.length <= 1}
+                onClick={() => onDeleteMemoryDataPreset()}
+              >
+                Delete preset
+              </button>
+            </div>
+
+            <div className="trainModalAddRow">
+              <input
+                type="text"
+                className="editInput trainInput"
+                value={memorySourceDraft}
+                onChange={(e) => setMemorySourceDraft(e.target.value)}
+                placeholder="English source line or phrase"
+                spellCheck={false}
+              />
+              <input
+                type="text"
+                className="editInput trainInput"
+                value={memoryTargetDraft}
+                onChange={(e) => setMemoryTargetDraft(e.target.value)}
+                placeholder="Preferred translation"
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                className="btn"
+                disabled={!memorySourceDraft.trim() || !memoryTargetDraft.trim()}
+                onClick={() => onAddMemoryDataEntry()}
+              >
+                Add
+              </button>
+            </div>
+
+            <div className="trainModalSearchRow">
+              <input
+                type="text"
+                className="editInput trainInput"
+                value={memorySearchText}
+                onChange={(e) => setMemorySearchText(e.target.value)}
+                placeholder="Search memory data (English or translation)"
+                spellCheck={false}
+              />
+            </div>
+
+            <div className="trainModalGridHead">
+              <div>English</div>
+              <div>Translation</div>
+              <div>Action</div>
+            </div>
+            <div className="trainModalList">
+              {filteredMemoryData.length ? (
+                filteredMemoryData.map((entry) => {
+                  const idx = activeMemoryData.indexOf(entry)
+                  if (idx < 0) return null
+                  return (
+                    <div key={`${entry.source}-${idx}`} className="trainModalRow">
+                      <textarea
+                        className="cueTextarea trainTextarea"
+                        value={entry.source}
+                        onChange={(e) => onMemoryDataEntryChange(idx, 'source', e.target.value)}
+                        spellCheck={false}
+                        rows={2}
+                      />
+                      <textarea
+                        className="cueTextarea trainTextarea"
+                        value={entry.target}
+                        onChange={(e) => onMemoryDataEntryChange(idx, 'target', e.target.value)}
+                        spellCheck={false}
+                        rows={2}
+                      />
+                      <button
+                        type="button"
+                        className="btn btnStop"
+                        onClick={() => onDeleteMemoryDataEntry(idx)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  )
+                })
+              ) : (
+                <div className="trainModalEmpty">No memory data found for this preset.</div>
+              )}
+            </div>
+
+            <div className="trainModalFooter">
+              {memoryHint ? <span className="editHint">{memoryHint}</span> : <span />}
+              <button
+                type="button"
+                className="btn primary"
+                disabled={!memoryDataDirty}
+                onClick={() => onSaveMemoryDataChanges()}
               >
                 Save changes
               </button>
