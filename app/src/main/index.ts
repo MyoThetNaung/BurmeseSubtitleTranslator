@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url'
 import Store from 'electron-store'
 import type {
   SubtitleCue,
+  CloudProvider,
   ModelId,
   AppConfig,
   OpenAiTier,
@@ -17,6 +18,7 @@ import { parseSrt, serializeSrt } from '@utils/index'
 import { LlamaServerManager } from './llamaServer'
 import {
   copyBundledModelsToUserData,
+  MODEL_FILES,
   modelExists,
   resolveDefaultModelsDir,
   shouldSuggestCopyModelsToAppData,
@@ -26,10 +28,16 @@ import { getSystemInfo } from './systemInfo'
 import { runTranslateJob, runTranslateOneCue } from './translateService'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const GEMINI_AVAILABLE_MODELS = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash']
+const OPENAI_AVAILABLE_MODELS = ['gpt-5-mini', 'gpt-5', 'gpt-4.1-mini', 'gpt-4.1']
 
 const store = new Store<AppConfig & { nGpuLayers?: number }>({
   defaults: {
-    selectedModel: 'qwen9b',
+    selectedModel: 'local',
+    localModelFile: '',
+    cloudProvider: 'gemini' as CloudProvider,
+    geminiModelId: GEMINI_AVAILABLE_MODELS[0],
+    openaiModelId: OPENAI_AVAILABLE_MODELS[0],
     modelsDir: undefined,
     openaiTier: 'normal' satisfies OpenAiTier,
     cloudTargetLanguage: 'myanmar' satisfies TranslationLanguage,
@@ -46,6 +54,17 @@ const store = new Store<AppConfig & { nGpuLayers?: number }>({
 const llama = new LlamaServerManager()
 
 let mainWindow: BrowserWindow | null = null
+
+async function listLocalModelFiles(modelsDir: string): Promise<string[]> {
+  try {
+    const names = await fs.readdir(modelsDir)
+    return names
+      .filter((name) => name.toLowerCase().endsWith('.gguf'))
+      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
+  } catch {
+    return []
+  }
+}
 
 /** Env-tunable default for `-ngl` when GPU mode is selected (see README). */
 function layersForGpuMode(): number {
@@ -198,35 +217,51 @@ function registerIpc(): void {
     store.set('translationMemory', activeMemory)
   }
 
-  const mergeTranslationMemory = (
-    base: TranslationMemoryEntry[],
-    extra: TranslationMemoryEntry[],
-  ): TranslationMemoryEntry[] => {
-    const bySource = new Map<string, TranslationMemoryEntry>()
-    for (const entry of base) {
-      bySource.set(entry.source.toLowerCase(), entry)
-    }
-    for (const entry of extra) {
-      const source = entry.source.trim()
-      const target = entry.target.trim()
-      if (!source || !target) continue
-      bySource.set(source.toLowerCase(), { source, target })
-    }
-    return [...bySource.values()].slice(0, 500)
-  }
-
   ipcMain.handle('config:get', async () => {
     const modelsDir = resolveDefaultModelsDir(store.get('modelsDir'))
+    const localModels = await listLocalModelFiles(modelsDir)
     const raw = store.get('selectedModel')
+    const legacyLocalDefault =
+      raw === 'qwen27b' ? MODEL_FILES.qwen27b : raw === 'qwen9b' ? MODEL_FILES.qwen9b : ''
     const safeModel: ModelId =
-      raw === 'qwen9b' || raw === 'qwen27b' || raw === 'gemini' || raw === 'openai' ? raw : 'qwen9b'
+      raw === 'local' ||
+      raw === 'qwen9b' ||
+      raw === 'qwen27b' ||
+      raw === 'gemini' ||
+      raw === 'openai'
+        ? raw === 'qwen9b' || raw === 'qwen27b'
+          ? 'local'
+          : raw
+        : 'local'
     if (raw !== safeModel) {
       store.set('selectedModel', safeModel)
+    }
+    const rawLocalModelFile = store.get('localModelFile')
+    let safeLocalModelFile =
+      typeof rawLocalModelFile === 'string' && rawLocalModelFile.trim().length > 0
+        ? rawLocalModelFile.trim()
+        : legacyLocalDefault
+    if (safeLocalModelFile && !localModels.includes(safeLocalModelFile)) {
+      safeLocalModelFile = ''
+    }
+    if (rawLocalModelFile !== safeLocalModelFile) {
+      store.set('localModelFile', safeLocalModelFile)
     }
     const n = defaultGpuLayers()
     const geminiKey = store.get('geminiApiKey')
     const openaiKey = store.get('openaiApiKey')
     const openaiTier: OpenAiTier = store.get('openaiTier') === 'premium' ? 'premium' : 'normal'
+    const cloudProvider: CloudProvider = store.get('cloudProvider') === 'openai' ? 'openai' : 'gemini'
+    const geminiModelRaw = store.get('geminiModelId')
+    const openaiModelRaw = store.get('openaiModelId')
+    const geminiModelId =
+      typeof geminiModelRaw === 'string' && geminiModelRaw.trim().length > 0
+        ? geminiModelRaw.trim()
+        : GEMINI_AVAILABLE_MODELS[0]
+    const openaiModelId =
+      typeof openaiModelRaw === 'string' && openaiModelRaw.trim().length > 0
+        ? openaiModelRaw.trim()
+        : OPENAI_AVAILABLE_MODELS[0]
     const cloudTargetLanguage: TranslationLanguage =
       store.get('cloudTargetLanguage') === 'thai' ? 'thai' : 'myanmar'
     const translationPresets = readTranslationPresets()
@@ -236,6 +271,8 @@ function registerIpc(): void {
     writePresetsAndActive(translationPresets, activeTranslationPresetId)
     return {
       selectedModel: safeModel,
+      localModelFile: safeLocalModelFile || null,
+      localModels,
       modelsDir: store.get('modelsDir') ?? null,
       resolvedModelsDir: modelsDir,
       nGpuLayers: n,
@@ -244,6 +281,11 @@ function registerIpc(): void {
       geminiApiKeyConfigured: typeof geminiKey === 'string' && geminiKey.trim().length > 0,
       openaiApiKeyConfigured: typeof openaiKey === 'string' && openaiKey.trim().length > 0,
       openaiTier,
+      cloudProvider,
+      geminiModelId,
+      openaiModelId,
+      geminiAvailableModels: GEMINI_AVAILABLE_MODELS,
+      openaiAvailableModels: OPENAI_AVAILABLE_MODELS,
       cloudTargetLanguage,
       translationMemory,
       translationPresets,
@@ -258,12 +300,25 @@ function registerIpc(): void {
       partial: Partial<AppConfig & { nGpuLayers?: number; inferenceMode?: 'cpu' | 'gpu' }>,
     ) => {
       if (
+        partial.selectedModel === 'local' ||
         partial.selectedModel === 'qwen9b' ||
         partial.selectedModel === 'qwen27b' ||
         partial.selectedModel === 'gemini' ||
         partial.selectedModel === 'openai'
       ) {
-        store.set('selectedModel', partial.selectedModel)
+        const normalized =
+          partial.selectedModel === 'qwen9b' || partial.selectedModel === 'qwen27b'
+            ? 'local'
+            : partial.selectedModel
+        store.set('selectedModel', normalized)
+        if (partial.selectedModel === 'qwen9b') {
+          store.set('localModelFile', MODEL_FILES.qwen9b)
+        } else if (partial.selectedModel === 'qwen27b') {
+          store.set('localModelFile', MODEL_FILES.qwen27b)
+        }
+      }
+      if (partial.localModelFile !== undefined) {
+        store.set('localModelFile', partial.localModelFile.trim())
       }
       if (partial.geminiApiKey !== undefined) {
         store.set('geminiApiKey', partial.geminiApiKey)
@@ -273,6 +328,15 @@ function registerIpc(): void {
       }
       if (partial.openaiTier === 'normal' || partial.openaiTier === 'premium') {
         store.set('openaiTier', partial.openaiTier)
+      }
+      if (partial.cloudProvider === 'gemini' || partial.cloudProvider === 'openai') {
+        store.set('cloudProvider', partial.cloudProvider)
+      }
+      if (typeof partial.geminiModelId === 'string' && partial.geminiModelId.trim()) {
+        store.set('geminiModelId', partial.geminiModelId.trim())
+      }
+      if (typeof partial.openaiModelId === 'string' && partial.openaiModelId.trim()) {
+        store.set('openaiModelId', partial.openaiModelId.trim())
       }
       if (partial.cloudTargetLanguage === 'myanmar' || partial.cloudTargetLanguage === 'thai') {
         store.set('cloudTargetLanguage', partial.cloudTargetLanguage)
@@ -415,6 +479,9 @@ function registerIpc(): void {
       payload: {
         cues: SubtitleCue[]
         modelKey: ModelId
+        localModelFile?: string
+        geminiModelId?: string
+        openaiModelId?: string
         targetLanguage?: TranslationLanguage
         translationMemory?: TranslationMemoryEntry[]
       },
@@ -424,13 +491,23 @@ function registerIpc(): void {
 
       const modelsDir = resolveDefaultModelsDir(store.get('modelsDir'))
       const modelKey =
+        payload.modelKey === 'local' ||
         payload.modelKey === 'qwen9b' ||
         payload.modelKey === 'qwen27b' ||
         payload.modelKey === 'gemini' ||
         payload.modelKey === 'openai'
           ? payload.modelKey
-          : 'qwen9b'
-      store.set('selectedModel', modelKey)
+          : 'local'
+      const normalizedModelKey =
+        modelKey === 'qwen9b' || modelKey === 'qwen27b' ? 'local' : modelKey
+      store.set('selectedModel', normalizedModelKey)
+      const localModelFile =
+        normalizedModelKey === 'local'
+          ? (payload.localModelFile ?? store.get('localModelFile') ?? '').trim()
+          : ''
+      if (normalizedModelKey === 'local') {
+        store.set('localModelFile', localModelFile)
+      }
 
       const tierRaw = store.get('openaiTier')
       const openaiTier: OpenAiTier = tierRaw === 'premium' ? 'premium' : 'normal'
@@ -457,28 +534,18 @@ function registerIpc(): void {
 
       const result = await runTranslateJob(win, llama, {
         cues: payload.cues,
-        modelKey,
+        modelKey: normalizedModelKey,
+        localModelFile,
         modelsDir,
         nGpuLayers: defaultGpuLayers(),
         geminiApiKey: store.get('geminiApiKey'),
+        geminiModelId: (payload.geminiModelId ?? store.get('geminiModelId') ?? '').trim(),
         openaiApiKey: store.get('openaiApiKey'),
+        openaiModelId: (payload.openaiModelId ?? store.get('openaiModelId') ?? '').trim(),
         openaiTier,
         targetLanguage,
         translationMemory,
       })
-      const learnedPairs: TranslationMemoryEntry[] = result
-        .map((cue, i) => ({
-          source: payload.cues[i]?.text?.trim() ?? '',
-          target: cue.text.trim(),
-        }))
-        .filter((entry) => entry.source.length > 0 && entry.target.length > 0)
-      const mergedMemory = mergeTranslationMemory(translationMemory, learnedPairs)
-      const presets = readTranslationPresets()
-      const activeId = activePresetId(presets)
-      writePresetsAndActive(
-        presets.map((preset) => (preset.id === activeId ? { ...preset, memory: mergedMemory } : preset)),
-        activeId,
-      )
       return result
     },
   )
@@ -495,6 +562,9 @@ function registerIpc(): void {
       payload: {
         cue: SubtitleCue
         modelKey: ModelId
+        localModelFile?: string
+        geminiModelId?: string
+        openaiModelId?: string
         targetLanguage?: TranslationLanguage
         translationMemory?: TranslationMemoryEntry[]
       },
@@ -504,13 +574,23 @@ function registerIpc(): void {
 
       const modelsDir = resolveDefaultModelsDir(store.get('modelsDir'))
       const modelKey =
+        payload.modelKey === 'local' ||
         payload.modelKey === 'qwen9b' ||
         payload.modelKey === 'qwen27b' ||
         payload.modelKey === 'gemini' ||
         payload.modelKey === 'openai'
           ? payload.modelKey
-          : 'qwen9b'
-      store.set('selectedModel', modelKey)
+          : 'local'
+      const normalizedModelKey =
+        modelKey === 'qwen9b' || modelKey === 'qwen27b' ? 'local' : modelKey
+      store.set('selectedModel', normalizedModelKey)
+      const localModelFile =
+        normalizedModelKey === 'local'
+          ? (payload.localModelFile ?? store.get('localModelFile') ?? '').trim()
+          : ''
+      if (normalizedModelKey === 'local') {
+        store.set('localModelFile', localModelFile)
+      }
 
       const tierRaw = store.get('openaiTier')
       const openaiTier: OpenAiTier = tierRaw === 'premium' ? 'premium' : 'normal'
@@ -537,26 +617,18 @@ function registerIpc(): void {
 
       const result = await runTranslateOneCue(win, llama, {
         cue: payload.cue,
-        modelKey,
+        modelKey: normalizedModelKey,
+        localModelFile,
         modelsDir,
         nGpuLayers: defaultGpuLayers(),
         geminiApiKey: store.get('geminiApiKey'),
+        geminiModelId: (payload.geminiModelId ?? store.get('geminiModelId') ?? '').trim(),
         openaiApiKey: store.get('openaiApiKey'),
+        openaiModelId: (payload.openaiModelId ?? store.get('openaiModelId') ?? '').trim(),
         openaiTier,
         targetLanguage,
         translationMemory,
       })
-      if (payload.cue.text.trim() && result.trim()) {
-        const merged = mergeTranslationMemory(translationMemory, [
-          { source: payload.cue.text.trim(), target: result.trim() },
-        ])
-        const presets = readTranslationPresets()
-        const activeId = activePresetId(presets)
-        writePresetsAndActive(
-          presets.map((preset) => (preset.id === activeId ? { ...preset, memory: merged } : preset)),
-          activeId,
-        )
-      }
       return result
     },
   )

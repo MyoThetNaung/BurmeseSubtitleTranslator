@@ -22,7 +22,8 @@ import { parseTranslatedLines } from '@utils/parseModelOutput'
 import { LlamaServerManager, TranslationCancelled } from './llamaServer'
 import type { BrowserWindow } from 'electron'
 
-function openAiModelForTier(tier: OpenAiTier): string {
+function openAiModelForTier(tier: OpenAiTier, preferred?: string): string {
+  if (preferred && preferred.trim()) return preferred.trim()
   if (tier === 'premium') {
     const raw = process.env.SUBTITLE_OPENAI_MODEL_PREMIUM
     if (raw && raw.trim()) return raw.trim()
@@ -100,17 +101,18 @@ export async function runOpenAiTranslateJob(
   opts: {
     cues: SubtitleCue[]
     apiKey: string
+    modelId?: string
     tier: OpenAiTier
     targetLanguage: TranslationLanguage
     translationMemory: TranslationMemoryEntry[]
   },
 ): Promise<SubtitleCue[]> {
-  const { cues, apiKey, tier, targetLanguage, translationMemory } = opts
+  const { cues, apiKey, modelId, tier, targetLanguage, translationMemory } = opts
   const fastMode = process.env.SUBTITLE_FAST_TEST === '1'
   const linesPerBatch = fastMode ? 3 : 7
 
   const client = new OpenAI({ apiKey })
-  const model = openAiModelForTier(tier)
+  const model = openAiModelForTier(tier, modelId)
 
   const batches = buildBatches(cues, linesPerBatch)
   const translatedTexts: string[] = cues.map((c) => c.text)
@@ -212,12 +214,13 @@ export async function runOpenAiTranslateOneCue(
   opts: {
     cue: SubtitleCue
     apiKey: string
+    modelId?: string
     tier: OpenAiTier
     targetLanguage: TranslationLanguage
     translationMemory: TranslationMemoryEntry[]
   },
 ): Promise<string> {
-  const { cue, apiKey, tier, targetLanguage, translationMemory } = opts
+  const { cue, apiKey, modelId, tier, targetLanguage, translationMemory } = opts
   const source = cue.text
 
   if (llama.isInferenceCancelled()) {
@@ -225,7 +228,7 @@ export async function runOpenAiTranslateOneCue(
   }
 
   const client = new OpenAI({ apiKey })
-  const model = openAiModelForTier(tier)
+  const model = openAiModelForTier(tier, modelId)
   const remembered = buildExactMemoryMap(translationMemory).get(normalizeForKey(source))
   if (remembered) return remembered
 

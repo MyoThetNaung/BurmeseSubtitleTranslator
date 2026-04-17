@@ -14,11 +14,56 @@ import { parseTranslatedLines } from '@utils/parseModelOutput'
 import { LlamaServerManager, TranslationCancelled } from './llamaServer'
 import type { BrowserWindow } from 'electron'
 
-function geminiModelName(): string {
+function geminiModelName(preferred?: string): string {
+  if (preferred && preferred.trim()) return preferred.trim()
   const raw = process.env.SUBTITLE_GEMINI_MODEL
   if (raw && raw.trim()) return raw.trim()
   // gemini-2.0-flash is not available to new API keys; 2.5 Flash is the current default.
   return 'gemini-2.5-flash'
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function isGeminiTransientError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error)
+  return (
+    /\b503\b/.test(msg) ||
+    /Service Unavailable/i.test(msg) ||
+    /high demand/i.test(msg) ||
+    /\b429\b/.test(msg) ||
+    /resource exhausted/i.test(msg) ||
+    /rate limit/i.test(msg)
+  )
+}
+
+async function generateContentStreamWithRetry(
+  model: ReturnType<GoogleGenerativeAI['getGenerativeModel']>,
+  prompt: string,
+  maxOutputTokens: number,
+  temperature: number,
+): Promise<Awaited<ReturnType<typeof model.generateContentStream>>> {
+  const attempts = [0, 1200, 2600, 5200]
+  let lastError: unknown = null
+  for (let i = 0; i < attempts.length; i++) {
+    if (attempts[i] > 0) await sleep(attempts[i])
+    try {
+      return await model.generateContentStream({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          maxOutputTokens,
+          temperature,
+        },
+      })
+    } catch (error) {
+      lastError = error
+      if (!isGeminiTransientError(error) || i === attempts.length - 1) {
+        throw error
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError))
 }
 
 function hasMyanmarChars(input: string): boolean {
@@ -81,16 +126,17 @@ export async function runGeminiTranslateJob(
   opts: {
     cues: SubtitleCue[]
     apiKey: string
+    modelId?: string
     targetLanguage: TranslationLanguage
     translationMemory: TranslationMemoryEntry[]
   },
 ): Promise<SubtitleCue[]> {
-  const { cues, apiKey, targetLanguage, translationMemory } = opts
+  const { cues, apiKey, modelId, targetLanguage, translationMemory } = opts
   const fastMode = process.env.SUBTITLE_FAST_TEST === '1'
   const linesPerBatch = fastMode ? 3 : 7
 
   const genAI = new GoogleGenerativeAI(apiKey)
-  const model = genAI.getGenerativeModel({ model: geminiModelName() })
+  const model = genAI.getGenerativeModel({ model: geminiModelName(modelId) })
 
   const batches = buildBatches(cues, linesPerBatch)
   const translatedTexts: string[] = cues.map((c) => c.text)
@@ -107,13 +153,7 @@ export async function runGeminiTranslateJob(
       let prompt = buildTranslationPrompt(subtitleBatch, targetLanguage, translationMemory)
 
       const runStream = async (p: string): Promise<string> => {
-        const stream = await model.generateContentStream({
-          contents: [{ role: 'user', parts: [{ text: p }] }],
-          generationConfig: {
-            maxOutputTokens: 4096,
-            temperature: 0.15,
-          },
-        })
+        const stream = await generateContentStreamWithRetry(model, p, 4096, 0.15)
         let acc = ''
         for await (const chunk of stream.stream) {
           if (llama.isInferenceCancelled()) {
@@ -134,7 +174,8 @@ export async function runGeminiTranslateJob(
       let outLines = parseTranslatedLines(full, batch.lines.length)
 
       const suspiciousCount = outLines.reduce(
-        (acc, line, i) => acc + (looksUntranslated(batch.lines[i] ?? '', line ?? '') ? 1 : 0),
+        (acc: number, line: string, i: number) =>
+          acc + (looksUntranslated(batch.lines[i] ?? '', line ?? '') ? 1 : 0),
         0,
       )
       const shouldRetryStrict =
@@ -189,11 +230,12 @@ export async function runGeminiTranslateOneCue(
   opts: {
     cue: SubtitleCue
     apiKey: string
+    modelId?: string
     targetLanguage: TranslationLanguage
     translationMemory: TranslationMemoryEntry[]
   },
 ): Promise<string> {
-  const { cue, apiKey, targetLanguage, translationMemory } = opts
+  const { cue, apiKey, modelId, targetLanguage, translationMemory } = opts
   const source = cue.text
 
   if (llama.isInferenceCancelled()) {
@@ -201,7 +243,7 @@ export async function runGeminiTranslateOneCue(
   }
 
   const genAI = new GoogleGenerativeAI(apiKey)
-  const model = genAI.getGenerativeModel({ model: geminiModelName() })
+  const model = genAI.getGenerativeModel({ model: geminiModelName(modelId) })
   const remembered = buildExactMemoryMap(translationMemory).get(normalizeForKey(source))
   if (remembered) return remembered
 
@@ -218,10 +260,7 @@ export async function runGeminiTranslateOneCue(
     `English: ${source}\n` +
     `${targetLabel}:`
 
-  const stream = await model.generateContentStream({
-    contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-    generationConfig: { maxOutputTokens: 512, temperature: 0.1 },
-  })
+  const stream = await generateContentStreamWithRetry(model, userPrompt, 512, 0.1)
 
   let full = ''
   for await (const chunk of stream.stream) {

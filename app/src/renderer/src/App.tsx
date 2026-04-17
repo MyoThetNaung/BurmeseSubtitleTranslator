@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { parseWorkspaceJson } from '@utils/index'
 import type {
+  CloudProvider,
   OpenAiTier,
   SubtitleCue,
   ModelId,
@@ -86,10 +87,13 @@ function cleanPresets(
 }
 
 export function App(): JSX.Element {
+  const [runMode, setRunMode] = useState<'local' | 'cloud'>('local')
   const [cues, setCues] = useState<SubtitleCue[]>([])
   const [translated, setTranslated] = useState<SubtitleCue[] | null>(null)
   const [fileLabel, setFileLabel] = useState<string>('')
-  const [model, setModel] = useState<ModelId>('qwen9b')
+  const [model, setModel] = useState<ModelId>('local')
+  const [localModelFile, setLocalModelFile] = useState('')
+  const [localModels, setLocalModels] = useState<string[]>([])
   const [inferenceMode, setInferenceMode] = useState<'gpu' | 'cpu'>('gpu')
   const [busy, setBusy] = useState(false)
   const [retranslatingIdx, setRetranslatingIdx] = useState<number | null>(null)
@@ -109,6 +113,11 @@ export function App(): JSX.Element {
   const [openaiApiKeyConfigured, setOpenaiApiKeyConfigured] = useState(false)
   const [openaiKeyDraft, setOpenaiKeyDraft] = useState('')
   const [openAiTier, setOpenAiTier] = useState<OpenAiTier>('normal')
+  const [cloudProvider, setCloudProvider] = useState<CloudProvider>('gemini')
+  const [geminiModelId, setGeminiModelId] = useState('gemini-2.5-flash')
+  const [openaiModelId, setOpenaiModelId] = useState('gpt-5-mini')
+  const [geminiAvailableModels, setGeminiAvailableModels] = useState<string[]>([])
+  const [openaiAvailableModels, setOpenaiAvailableModels] = useState<string[]>([])
   const [cloudTargetLanguage, setCloudTargetLanguage] = useState<TranslationLanguage>('myanmar')
   const [translationMemory, setTranslationMemory] = useState<TranslationMemoryEntry[]>([])
   const [translationPresets, setTranslationPresets] = useState<TranslationPreset[]>([])
@@ -127,8 +136,6 @@ export function App(): JSX.Element {
   const [memorySourceDraft, setMemorySourceDraft] = useState('')
   const [memoryTargetDraft, setMemoryTargetDraft] = useState('')
   const [memoryHint, setMemoryHint] = useState<string | null>(null)
-  const [cloudSettingsTab, setCloudSettingsTab] = useState<'gemini' | 'openai'>('gemini')
-
   const api = window.subtitleApp
 
   useEffect(() => {
@@ -136,16 +143,29 @@ export function App(): JSX.Element {
       try {
         const cfg = await api.getConfig()
         if (
+          cfg.selectedModel === 'local' ||
           cfg.selectedModel === 'qwen9b' ||
           cfg.selectedModel === 'qwen27b' ||
           cfg.selectedModel === 'gemini' ||
           cfg.selectedModel === 'openai'
         ) {
-          setModel(cfg.selectedModel)
+          const selected =
+            cfg.selectedModel === 'qwen9b' || cfg.selectedModel === 'qwen27b'
+              ? 'local'
+              : cfg.selectedModel
+          setModel(selected)
+          setRunMode(selected === 'local' ? 'local' : 'cloud')
         }
+        setLocalModels(Array.isArray(cfg.localModels) ? cfg.localModels : [])
+        setLocalModelFile(typeof cfg.localModelFile === 'string' ? cfg.localModelFile : '')
         setGeminiApiKeyConfigured(cfg.geminiApiKeyConfigured)
         setOpenaiApiKeyConfigured(cfg.openaiApiKeyConfigured)
         setOpenAiTier(cfg.openaiTier)
+        setCloudProvider(cfg.cloudProvider === 'openai' ? 'openai' : 'gemini')
+        setGeminiModelId(cfg.geminiModelId || 'gemini-2.5-flash')
+        setOpenaiModelId(cfg.openaiModelId || 'gpt-5-mini')
+        setGeminiAvailableModels(cfg.geminiAvailableModels ?? [])
+        setOpenaiAvailableModels(cfg.openaiAvailableModels ?? [])
         setCloudTargetLanguage(cfg.cloudTargetLanguage)
         const safePresets = cleanPresets(cfg.translationPresets ?? [], cfg.translationMemory ?? [])
         const safeActiveId = safePresets.some((preset) => preset.id === cfg.activeTranslationPresetId)
@@ -179,11 +199,6 @@ export function App(): JSX.Element {
       /* ignore malformed local cache */
     }
   }, [])
-
-  useEffect(() => {
-    if (model === 'gemini') setCloudSettingsTab('gemini')
-    if (model === 'openai') setCloudSettingsTab('openai')
-  }, [model])
 
   useEffect(() => {
     const offP = api.onTranslateProgress((d) => {
@@ -247,10 +262,43 @@ export function App(): JSX.Element {
     [api, loadFromText],
   )
 
-  const onModelChange = useCallback(
-    async (m: ModelId) => {
-      setModel(m)
-      await api.setConfig({ selectedModel: m })
+  const onRunModeChange = useCallback(
+    async (mode: 'local' | 'cloud') => {
+      setRunMode(mode)
+      const selectedModel: ModelId = mode === 'local' ? 'local' : cloudProvider
+      setModel(selectedModel)
+      await api.setConfig({ selectedModel })
+    },
+    [api, cloudProvider],
+  )
+
+  const onCloudProviderChange = useCallback(
+    async (provider: CloudProvider) => {
+      setCloudProvider(provider)
+      setRunMode('cloud')
+      setModel(provider)
+      await api.setConfig({ cloudProvider: provider, selectedModel: provider })
+    },
+    [api],
+  )
+
+  const onCloudModelChange = useCallback(
+    async (provider: CloudProvider, modelId: string) => {
+      if (provider === 'gemini') {
+        setGeminiModelId(modelId)
+        await api.setConfig({ geminiModelId: modelId })
+      } else {
+        setOpenaiModelId(modelId)
+        await api.setConfig({ openaiModelId: modelId })
+      }
+    },
+    [api],
+  )
+
+  const onLocalModelFileChange = useCallback(
+    async (filename: string) => {
+      setLocalModelFile(filename)
+      await api.setConfig({ localModelFile: filename })
     },
     [api],
   )
@@ -276,14 +324,6 @@ export function App(): JSX.Element {
     setOpenaiApiKeyConfigured(v.length > 0)
     setOpenaiKeyDraft('')
   }, [api, openaiKeyDraft])
-
-  const onOpenAiTierChange = useCallback(
-    async (tier: OpenAiTier) => {
-      setOpenAiTier(tier)
-      await api.setConfig({ openaiTier: tier })
-    },
-    [api],
-  )
 
   const onCloudTargetLanguageChange = useCallback(
     async (lang: TranslationLanguage) => {
@@ -494,12 +534,19 @@ export function App(): JSX.Element {
   ])
 
   const onDeleteMemoryDataEntry = useCallback(
-    (idx: number) => {
-      const nextPresets = memoryDataPresets.map((preset) =>
-        preset.id === activeMemoryDataPresetId
-          ? { ...preset, memory: preset.memory.filter((_, i) => i !== idx) }
-          : preset,
-      )
+    (idx: number, entry: TranslationMemoryEntry) => {
+      const nextPresets = memoryDataPresets.map((preset) => {
+        if (preset.id !== activeMemoryDataPresetId) return preset
+        const byIndex =
+          idx >= 0 && idx < preset.memory.length ? preset.memory.filter((_, i) => i !== idx) : preset.memory
+        // Fallback: if index misses due to filtered/stale view, remove one exact row match.
+        if (byIndex.length !== preset.memory.length) return { ...preset, memory: byIndex }
+        const exactIdx = preset.memory.findIndex(
+          (m) => m.source === entry.source && m.target === entry.target,
+        )
+        if (exactIdx < 0) return preset
+        return { ...preset, memory: preset.memory.filter((_, i) => i !== exactIdx) }
+      })
       persistMemoryDataPresets(nextPresets, activeMemoryDataPresetId)
       setMemoryDataDirty(false)
       setMemoryHint('Removed from memory data.')
@@ -634,7 +681,10 @@ export function App(): JSX.Element {
     try {
       const out = await api.translate({
         cues,
-        modelKey: model,
+        modelKey: runMode === 'local' ? 'local' : cloudProvider,
+        localModelFile,
+        geminiModelId,
+        openaiModelId,
         targetLanguage: cloudTargetLanguage,
         translationMemory: effectiveTranslationMemory,
       })
@@ -647,7 +697,17 @@ export function App(): JSX.Element {
     } finally {
       setBusy(false)
     }
-  }, [api, cues, model, cloudTargetLanguage, effectiveTranslationMemory])
+  }, [
+    api,
+    cues,
+    runMode,
+    cloudProvider,
+    localModelFile,
+    geminiModelId,
+    openaiModelId,
+    cloudTargetLanguage,
+    effectiveTranslationMemory,
+  ])
 
   const onOriginalCueTextChange = useCallback((idx: number, text: string) => {
     setCues((prev) => prev.map((c, i) => (i === idx ? { ...c, text } : c)))
@@ -722,8 +782,9 @@ export function App(): JSX.Element {
     const src = translated
     if (!src?.length) return
     const base = fileLabel ? fileLabel.replace(/\.[^.]+$/, '') : 'subtitles'
+    const activeModel = runMode === 'local' ? 'local' : cloudProvider
     const exportSuffix =
-      (model === 'gemini' || model === 'openai') && cloudTargetLanguage === 'thai'
+      activeModel !== 'local' && cloudTargetLanguage === 'thai'
         ? 'thai'
         : 'myanmar'
     const path = await api.saveSrtDialog(`${base}.${exportSuffix}.srt`)
@@ -731,7 +792,16 @@ export function App(): JSX.Element {
     const data = await api.serializeSubtitle(src)
     await api.writeUtf8File(path, data)
     await onSaveExportedTranslationMemory(cues, src)
-  }, [api, translated, fileLabel, model, cloudTargetLanguage, onSaveExportedTranslationMemory, cues])
+  }, [
+    api,
+    translated,
+    fileLabel,
+    runMode,
+    cloudProvider,
+    cloudTargetLanguage,
+    onSaveExportedTranslationMemory,
+    cues,
+  ])
 
   const onRetranslateLine = useCallback(
     async (idx: number) => {
@@ -742,7 +812,10 @@ export function App(): JSX.Element {
       try {
         const newText = await api.translateOne({
           cue,
-          modelKey: model,
+          modelKey: runMode === 'local' ? 'local' : cloudProvider,
+          localModelFile,
+          geminiModelId,
+          openaiModelId,
           targetLanguage: cloudTargetLanguage,
           translationMemory: effectiveTranslationMemory,
         })
@@ -761,7 +834,20 @@ export function App(): JSX.Element {
         setRetranslatingIdx(null)
       }
     },
-    [api, busy, cues, model, retranslatingIdx, cloudTargetLanguage, effectiveTranslationMemory],
+    [
+      api,
+      busy,
+      cues,
+      model,
+      runMode,
+      cloudProvider,
+      localModelFile,
+      geminiModelId,
+      openaiModelId,
+      retranslatingIdx,
+      cloudTargetLanguage,
+      effectiveTranslationMemory,
+    ],
   )
 
   const onSaveOriginal = useCallback(async () => {
@@ -803,8 +889,12 @@ export function App(): JSX.Element {
         replaceScope,
         replaceIgnoreCase,
         selectedModel: model,
+        localModelFile,
         inferenceMode,
         openaiTier: openAiTier,
+        cloudProvider,
+        geminiModelId,
+        openaiModelId,
         cloudTargetLanguage,
         translationMemory,
         translationPresets,
@@ -825,6 +915,7 @@ export function App(): JSX.Element {
     replaceScope,
     replaceIgnoreCase,
     model,
+    localModelFile,
     inferenceMode,
     openAiTier,
     cloudTargetLanguage,
@@ -850,6 +941,17 @@ export function App(): JSX.Element {
       setReplaceScope(ws.replaceScope)
       setReplaceIgnoreCase(ws.replaceIgnoreCase)
       setModel(ws.selectedModel)
+      setRunMode(ws.selectedModel === 'local' ? 'local' : 'cloud')
+      setCloudProvider(
+        ws.cloudProvider === 'openai'
+          ? 'openai'
+          : ws.selectedModel === 'openai'
+            ? 'openai'
+            : 'gemini',
+      )
+      setGeminiModelId(ws.geminiModelId ?? geminiModelId)
+      setOpenaiModelId(ws.openaiModelId ?? openaiModelId)
+      setLocalModelFile(ws.localModelFile ?? '')
       setInferenceMode(ws.inferenceMode)
       const nextTier = ws.openaiTier ?? 'normal'
       const nextTargetLanguage = ws.cloudTargetLanguage ?? 'myanmar'
@@ -868,8 +970,17 @@ export function App(): JSX.Element {
       setTrainDirty(false)
       await api.setConfig({
         selectedModel: ws.selectedModel,
+        localModelFile: ws.localModelFile,
         inferenceMode: ws.inferenceMode,
         openaiTier: nextTier,
+        cloudProvider:
+          ws.cloudProvider === 'openai'
+            ? 'openai'
+            : ws.selectedModel === 'openai'
+              ? 'openai'
+              : 'gemini',
+        geminiModelId: ws.geminiModelId ?? geminiModelId,
+        openaiModelId: ws.openaiModelId ?? openaiModelId,
         cloudTargetLanguage: nextTargetLanguage,
         translationMemory: nextTranslationMemory,
         translationPresets: nextPresets,
@@ -879,15 +990,16 @@ export function App(): JSX.Element {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
-  }, [api])
+  }, [api, geminiModelId, openaiModelId])
 
   const translatingFx = busy || retranslatingIdx !== null
+  const activeModel = runMode === 'local' ? 'local' : cloudProvider
   const translatedColumnLabel =
-    (model === 'gemini' || model === 'openai') && cloudTargetLanguage === 'thai'
+    activeModel !== 'local' && cloudTargetLanguage === 'thai'
       ? 'Translated (TH)'
       : 'Translated (MY)'
   const translatedPlaceholder =
-    (model === 'gemini' || model === 'openai') && cloudTargetLanguage === 'thai'
+    activeModel !== 'local' && cloudTargetLanguage === 'thai'
       ? 'Thai translation...'
       : 'Burmese translation...'
 
@@ -930,25 +1042,79 @@ export function App(): JSX.Element {
                 />
                 <div className="navMenuPanel" id="app-nav-menu" role="menu">
                   <label className="field navMenuField">
-                    <span>Model</span>
+                    <span>Mode</span>
                     <select
-                      value={model}
+                      value={runMode}
                       disabled={busy}
-                      onChange={(e) => void onModelChange(e.target.value as ModelId)}
+                      onChange={(e) => void onRunModeChange(e.target.value as 'local' | 'cloud')}
                     >
-                      <option value="qwen9b">Performance (local)</option>
-                      <option value="qwen27b">Quality (local)</option>
-                      <option value="gemini">Cloud (Gemini)</option>
-                      <option value="openai">Cloud (OpenAI)</option>
+                      <option value="local">Local</option>
+                      <option value="cloud">Cloud</option>
                     </select>
                   </label>
+                  {runMode === 'local' ? (
+                    <label className="field navMenuField">
+                      <span>Detected model file</span>
+                      <select
+                        value={localModelFile}
+                        disabled={busy || localModels.length === 0}
+                        onChange={(e) => void onLocalModelFileChange(e.target.value)}
+                      >
+                        {localModels.length === 0 ? (
+                          <option value="">No .gguf models found in models folder</option>
+                        ) : (
+                          <>
+                            <option value="">Select a model file...</option>
+                            {localModels.map((name) => (
+                              <option key={name} value={name}>
+                                {name}
+                              </option>
+                            ))}
+                          </>
+                        )}
+                      </select>
+                    </label>
+                  ) : null}
+
+                  {runMode === 'cloud' ? (
+                    <>
+                      <label className="field navMenuField">
+                        <span>Cloud provider</span>
+                        <select
+                          value={cloudProvider}
+                          disabled={busy}
+                          onChange={(e) => void onCloudProviderChange(e.target.value as CloudProvider)}
+                        >
+                          <option value="gemini">Google AI</option>
+                          <option value="openai">OpenAI</option>
+                        </select>
+                      </label>
+                      <label className="field navMenuField">
+                        <span>Cloud model</span>
+                        <select
+                          value={cloudProvider === 'gemini' ? geminiModelId : openaiModelId}
+                          disabled={busy}
+                          onChange={(e) => void onCloudModelChange(cloudProvider, e.target.value)}
+                        >
+                          {(cloudProvider === 'gemini'
+                            ? geminiAvailableModels
+                            : openaiAvailableModels
+                          ).map((modelId) => (
+                            <option key={modelId} value={modelId}>
+                              {modelId}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </>
+                  ) : null}
 
                   <div className="navMenuCloudSection" role="group" aria-label="Cloud API keys">
                     <label className="field navMenuField">
                       <span>Cloud translate to</span>
                       <select
                         value={cloudTargetLanguage}
-                        disabled={busy || (model !== 'gemini' && model !== 'openai')}
+                        disabled={busy || runMode !== 'cloud'}
                         onChange={(e) =>
                           void onCloudTargetLanguageChange(e.target.value as TranslationLanguage)
                         }
@@ -958,34 +1124,7 @@ export function App(): JSX.Element {
                       </select>
                     </label>
 
-                    <div className="navMenuCloudTabs">
-                      <button
-                        type="button"
-                        className={
-                          cloudSettingsTab === 'gemini'
-                            ? 'navMenuCloudTab navMenuCloudTabActive'
-                            : 'navMenuCloudTab'
-                        }
-                        disabled={busy}
-                        onClick={() => setCloudSettingsTab('gemini')}
-                      >
-                        Gemini
-                      </button>
-                      <button
-                        type="button"
-                        className={
-                          cloudSettingsTab === 'openai'
-                            ? 'navMenuCloudTab navMenuCloudTabActive'
-                            : 'navMenuCloudTab'
-                        }
-                        disabled={busy}
-                        onClick={() => setCloudSettingsTab('openai')}
-                      >
-                        OpenAI
-                      </button>
-                    </div>
-
-                    {cloudSettingsTab === 'gemini' ? (
+                    {cloudProvider === 'gemini' ? (
                       <div className="field navMenuField navMenuGemini">
                         <span>Gemini API key</span>
                         <p className="navMenuGeminiHint">
@@ -1061,19 +1200,6 @@ export function App(): JSX.Element {
                           </button>
                         </div>
 
-                        <label className="field navMenuField navMenuOpenAiTier">
-                          <span>OpenAI model</span>
-                          <select
-                            value={openAiTier}
-                            disabled={busy}
-                            onChange={(e) =>
-                              void onOpenAiTierChange(e.target.value as OpenAiTier)
-                            }
-                          >
-                            <option value="normal">Normal — GPT-5 mini</option>
-                            <option value="premium">Premium — GPT-5</option>
-                          </select>
-                        </label>
                       </div>
                     )}
                   </div>
@@ -1081,11 +1207,11 @@ export function App(): JSX.Element {
                   <label className="field navMenuField">
                     <span>
                       Inference{' '}
-                      {model === 'gemini' || model === 'openai' ? '(local only)' : ''}
+                      {runMode === 'cloud' ? '(local only)' : ''}
                     </span>
                     <select
                       value={inferenceMode}
-                      disabled={busy || model === 'gemini' || model === 'openai'}
+                      disabled={busy || runMode === 'cloud'}
                       onChange={(e) => void onInferenceModeChange(e.target.value as 'gpu' | 'cpu')}
                     >
                       <option value="gpu">GPU</option>
@@ -1638,7 +1764,7 @@ export function App(): JSX.Element {
                       <button
                         type="button"
                         className="btn btnStop"
-                        onClick={() => onDeleteMemoryDataEntry(idx)}
+                        onClick={() => onDeleteMemoryDataEntry(idx, entry)}
                       >
                         Remove
                       </button>

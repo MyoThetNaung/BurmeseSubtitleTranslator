@@ -34,6 +34,9 @@ const api = {
   translate: (payload: {
     cues: SubtitleCue[]
     modelKey: ModelId
+    localModelFile?: string
+    geminiModelId?: string
+    openaiModelId?: string
     targetLanguage?: TranslationLanguage
     translationMemory?: TranslationMemoryEntry[]
   }) =>
@@ -42,6 +45,9 @@ const api = {
   translateOne: (payload: {
     cue: SubtitleCue
     modelKey: ModelId
+    localModelFile?: string
+    geminiModelId?: string
+    openaiModelId?: string
     targetLanguage?: TranslationLanguage
     translationMemory?: TranslationMemoryEntry[]
   }) =>

@@ -9,7 +9,8 @@ export interface SubtitleCue {
   text: string
 }
 
-export type ModelId = 'qwen9b' | 'qwen27b' | 'gemini' | 'openai'
+export type ModelId = 'local' | 'qwen9b' | 'qwen27b' | 'gemini' | 'openai'
+export type CloudProvider = 'gemini' | 'openai'
 
 export type TranslationLanguage = 'myanmar' | 'thai'
 
@@ -29,6 +30,8 @@ export type OpenAiTier = 'normal' | 'premium'
 
 export interface AppConfig {
   selectedModel: ModelId
+  /** Selected GGUF filename when `selectedModel` is `local`. */
+  localModelFile?: string
   modelsDir?: string
   /** Google AI (Gemini) API key; persisted by the Electron main process only. */
   geminiApiKey?: string
@@ -36,6 +39,12 @@ export interface AppConfig {
   openaiApiKey?: string
   /** When `selectedModel` is `openai`, selects cost vs quality tier. */
   openaiTier?: OpenAiTier
+  /** Active cloud provider when running in cloud mode. */
+  cloudProvider?: CloudProvider
+  /** Selected Gemini model id, e.g. gemini-2.5-flash. */
+  geminiModelId?: string
+  /** Selected OpenAI model id, e.g. gpt-5-mini. */
+  openaiModelId?: string
   /** Cloud translation target language. */
   cloudTargetLanguage?: TranslationLanguage
   /** User-taught phrase/sentence memory used to steer future translations. */
@@ -49,6 +58,8 @@ export interface AppConfig {
 /** Safe subset from `config:get` (no plaintext API keys). */
 export interface RendererConfig {
   selectedModel: ModelId
+  localModelFile: string | null
+  localModels: string[]
   modelsDir: string | null
   resolvedModelsDir: string
   nGpuLayers: number
@@ -57,6 +68,11 @@ export interface RendererConfig {
   geminiApiKeyConfigured: boolean
   openaiApiKeyConfigured: boolean
   openaiTier: OpenAiTier
+  cloudProvider: CloudProvider
+  geminiModelId: string
+  openaiModelId: string
+  geminiAvailableModels: string[]
+  openaiAvailableModels: string[]
   cloudTargetLanguage: TranslationLanguage
   translationMemory: TranslationMemoryEntry[]
   translationPresets: TranslationPreset[]
@@ -76,9 +92,17 @@ export interface SubtitleWorkspace {
   replaceScope: 'original' | 'translated' | 'both'
   replaceIgnoreCase: boolean
   selectedModel: ModelId
+  /** Selected GGUF filename when `selectedModel` is `local`. */
+  localModelFile?: string
   inferenceMode: 'gpu' | 'cpu'
   /** Remembered when using Cloud (OpenAI); optional for older workspace files. */
   openaiTier?: OpenAiTier
+  /** Active cloud provider. */
+  cloudProvider?: CloudProvider
+  /** Selected Gemini model id. */
+  geminiModelId?: string
+  /** Selected OpenAI model id. */
+  openaiModelId?: string
   /** Cloud target language; optional for older workspace files. */
   cloudTargetLanguage?: TranslationLanguage
   /** Optional memory snapshot for this workspace. */

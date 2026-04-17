@@ -78,8 +78,9 @@ export function parseWorkspaceJson(text: string): SubtitleWorkspace {
     replaceScope = o.replaceScope
   }
 
-  let selectedModel: SubtitleWorkspace['selectedModel'] = 'qwen9b'
+  let selectedModel: SubtitleWorkspace['selectedModel'] = 'local'
   if (
+    o.selectedModel === 'local' ||
     o.selectedModel === 'qwen9b' ||
     o.selectedModel === 'qwen27b' ||
     o.selectedModel === 'gemini' ||
@@ -87,6 +88,10 @@ export function parseWorkspaceJson(text: string): SubtitleWorkspace {
   ) {
     selectedModel = o.selectedModel
   }
+  const localModelFile =
+    typeof o.localModelFile === 'string' && o.localModelFile.trim().length > 0
+      ? o.localModelFile.trim()
+      : undefined
   let inferenceMode: SubtitleWorkspace['inferenceMode'] = 'gpu'
   if (o.inferenceMode === 'cpu' || o.inferenceMode === 'gpu') {
     inferenceMode = o.inferenceMode
@@ -96,6 +101,16 @@ export function parseWorkspaceJson(text: string): SubtitleWorkspace {
   if (o.openaiTier === 'normal' || o.openaiTier === 'premium') {
     openaiTier = o.openaiTier
   }
+  const cloudProvider =
+    o.cloudProvider === 'gemini' || o.cloudProvider === 'openai' ? o.cloudProvider : undefined
+  const geminiModelId =
+    typeof o.geminiModelId === 'string' && o.geminiModelId.trim().length > 0
+      ? o.geminiModelId.trim()
+      : undefined
+  const openaiModelId =
+    typeof o.openaiModelId === 'string' && o.openaiModelId.trim().length > 0
+      ? o.openaiModelId.trim()
+      : undefined
   let cloudTargetLanguage: TranslationLanguage | undefined
   if (o.cloudTargetLanguage === 'myanmar' || o.cloudTargetLanguage === 'thai') {
     cloudTargetLanguage = o.cloudTargetLanguage
@@ -144,8 +159,12 @@ export function parseWorkspaceJson(text: string): SubtitleWorkspace {
     replaceScope,
     replaceIgnoreCase,
     selectedModel,
+    ...(localModelFile !== undefined ? { localModelFile } : {}),
     inferenceMode,
     ...(openaiTier !== undefined ? { openaiTier } : {}),
+    ...(cloudProvider !== undefined ? { cloudProvider } : {}),
+    ...(geminiModelId !== undefined ? { geminiModelId } : {}),
+    ...(openaiModelId !== undefined ? { openaiModelId } : {}),
     ...(cloudTargetLanguage !== undefined ? { cloudTargetLanguage } : {}),
     ...(translationMemory !== undefined ? { translationMemory } : {}),
     ...(translationPresets !== undefined ? { translationPresets } : {}),

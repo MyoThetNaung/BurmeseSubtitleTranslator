@@ -10,21 +10,26 @@ import type {
   TranslationMemoryEntry,
 } from '@utils/types'
 import { buildBatches } from '@utils/batchSubtitles'
-import { modelExists, resolveModelPath, resourcesEngineDir, MODEL_FILES } from './paths'
+import { resourcesEngineDir, MODEL_FILES } from './paths'
 import { runGeminiTranslateJob, runGeminiTranslateOneCue } from './geminiTranslate'
 import { runOpenAiTranslateJob, runOpenAiTranslateOneCue } from './openaiTranslate'
 import { LlamaServerManager, TranslationCancelled } from './llamaServer'
 import type { BrowserWindow } from 'electron'
+import { existsSync } from 'fs'
+import path from 'path'
 
 export interface TranslateJobOptions {
   cues: SubtitleCue[]
   modelKey: ModelId
+  localModelFile?: string
   modelsDir: string
   nGpuLayers: number
   /** Required when modelKey is `gemini`. */
   geminiApiKey?: string
+  geminiModelId?: string
   /** Required when modelKey is `openai`. */
   openaiApiKey?: string
+  openaiModelId?: string
   openaiTier?: OpenAiTier
   targetLanguage?: TranslationLanguage
   translationMemory?: TranslationMemoryEntry[]
@@ -97,11 +102,20 @@ function stripLeadingNumberPrefix(line: string): string {
   return line.replace(/^\s*(\d+)\s*[\.\)]\s*/, '').trim()
 }
 
+function splitCueLines(text: string): string[] {
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+}
+
 /**
  * Qwen3.5 “thinking” / reasoning output often puts **Analyze…** or headings first;
  * the Burmese line is usually after that or is the only line with Myanmar script.
  */
-function cleanSingleLineOutput(raw: string): string {
+function cleanSingleLineOutput(source: string, raw: string): string {
   const normalized = raw
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
@@ -111,24 +125,40 @@ function cleanSingleLineOutput(raw: string): string {
     .trim()
   if (!normalized) return ''
 
+  const sourceLines = splitCueLines(source)
+  const expectedLineCount = Math.max(1, sourceLines.length)
+
   const lines = normalized
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean)
 
   const substantive = lines.filter((l) => !isReasoningOrMetaLine(l))
-  const myanmarLine = substantive.find((l) => hasMyanmarChars(l))
-  const pick =
-    myanmarLine ??
-    (substantive.length > 0 ? substantive[substantive.length - 1] : undefined) ??
-    lines.filter((l) => !isReasoningOrMetaLine(l)).at(-1) ??
-    lines.at(-1) ??
-    ''
+  const cleanedSubstantive = substantive
+    .map((line) => stripLeadingNumberPrefix(line))
+    .filter((line) => line.length > 0)
 
-  const cleaned = stripLeadingNumberPrefix(pick)
-  if (/^<[^>]+>$/.test(cleaned)) return ''
-  if (isReasoningOrMetaLine(cleaned) && !hasMyanmarChars(cleaned)) return ''
-  return cleaned
+  if (expectedLineCount <= 1) {
+    const myanmarLine = cleanedSubstantive.find((l) => hasMyanmarChars(l))
+    const pick =
+      myanmarLine ??
+      (cleanedSubstantive.length > 0 ? cleanedSubstantive[cleanedSubstantive.length - 1] : undefined) ??
+      lines.filter((l) => !isReasoningOrMetaLine(l)).at(-1) ??
+      lines.at(-1) ??
+      ''
+
+    const cleaned = stripLeadingNumberPrefix(pick)
+    if (/^<[^>]+>$/.test(cleaned)) return ''
+    if (isReasoningOrMetaLine(cleaned) && !hasMyanmarChars(cleaned)) return ''
+    return cleaned
+  }
+
+  const multiLineCandidates =
+    cleanedSubstantive.length > 0
+      ? cleanedSubstantive
+      : lines.map((line) => stripLeadingNumberPrefix(line)).filter((line) => line.length > 0)
+  const picked = multiLineCandidates.slice(0, expectedLineCount).join('\n').trim()
+  return picked
 }
 
 function maxTokensForModel(modelKey: ModelId): number {
@@ -187,12 +217,12 @@ function buildLinePrompt(
   const memorySection = glossaryPromptSection(memory)
   const antiReason =
     modelKey === 'qwen27b'
-      ? 'Do not analyze or explain. No headings, no markdown. Myanmar script only; translate names into Burmese script, one line.\n'
+      ? 'Do not analyze or explain. No headings, no markdown. Myanmar script only; keep the same number of lines as the input.\n'
       : ''
   if (strict) {
     return (
       antiReason +
-      'STRICT: Burmese only; translate names into Burmese script. No analysis.\n' +
+      'STRICT: Burmese only; translate names into Burmese script. Keep the same number of lines as the input. No analysis.\n' +
       memorySection +
       `English: ${source}\n` +
       'Burmese:'
@@ -200,7 +230,7 @@ function buildLinePrompt(
   }
   return (
     antiReason +
-    'Translate the subtitle line to Burmese (Myanmar script), including names in Burmese script. Output only Burmese text.\n' +
+    'Translate the subtitle line to Burmese (Myanmar script), including names in Burmese script. Keep the same number of lines as the input. Output only Burmese text.\n' +
     memorySection +
     `English: ${source}\n` +
     'Burmese:'
@@ -210,10 +240,56 @@ function buildLinePrompt(
 function buildBareStrictLinePrompt(source: string): string {
   return (
     'Translate this one English subtitle line to Burmese (Myanmar script).\n' +
-    'Output only one Burmese line. No list. No quotes. No glossary format. No repeated words.\n' +
+    'Keep the same number of lines as the English input. No list. No quotes. No glossary format. No repeated words.\n' +
     `English: ${source}\n` +
     'Burmese:'
   )
+}
+
+async function translateMultilineCueByLine(
+  llama: LlamaServerManager,
+  modelKey: ModelId,
+  source: string,
+  memory: TranslationMemoryEntry[],
+): Promise<string> {
+  const sourceLines = splitCueLines(source)
+  if (sourceLines.length <= 1) return ''
+  const mt = maxTokensForModel(modelKey)
+  const translatedLines: string[] = []
+  for (const line of sourceLines) {
+    const remembered = buildExactMemoryMap(memory).get(normalizeForKey(line))
+    if (remembered) {
+      translatedLines.push(remembered)
+      continue
+    }
+    let full = ''
+    const strictPrompt = buildLinePrompt(modelKey, line, true, memory)
+    for await (const piece of llama.completionStream(strictPrompt, {
+      maxTokens: mt,
+      temperature: 0,
+    })) {
+      full += piece
+    }
+    let out = cleanSingleLineOutput(line, full)
+    const bad =
+      looksUntranslated(line, out) ||
+      looksLikeGlossaryEcho(out) ||
+      looksLikeRepetitionSpam(out) ||
+      (modelKey === 'qwen27b' && out.length > 0 && !hasMyanmarChars(out))
+    if (bad) {
+      let bareStrictFull = ''
+      const bareStrictPrompt = buildBareStrictLinePrompt(line)
+      for await (const piece of llama.completionStream(bareStrictPrompt, {
+        maxTokens: mt,
+        temperature: 0,
+      })) {
+        bareStrictFull += piece
+      }
+      out = cleanSingleLineOutput(line, bareStrictFull)
+    }
+    translatedLines.push(out || line)
+  }
+  return translatedLines.join('\n').trim()
 }
 
 function cloneCuesWithTexts(cues: SubtitleCue[], texts: string[]): SubtitleCue[] {
@@ -246,6 +322,7 @@ export async function runTranslateJob(
     return runGeminiTranslateJob(win, llama, {
       cues,
       apiKey: key,
+      modelId: opts.geminiModelId,
       targetLanguage: opts.targetLanguage ?? 'myanmar',
       translationMemory,
     })
@@ -262,20 +339,30 @@ export async function runTranslateJob(
     return runOpenAiTranslateJob(win, llama, {
       cues,
       apiKey: key,
+      modelId: opts.openaiModelId,
       tier,
       targetLanguage: opts.targetLanguage ?? 'myanmar',
       translationMemory,
     })
   }
 
-  if (!modelExists(modelKey, modelsDir)) {
-    const expectedFile = modelKey === 'qwen27b' ? MODEL_FILES.qwen27b : MODEL_FILES.qwen9b
+  const localModelFile =
+    modelKey === 'local'
+      ? opts.localModelFile?.trim() ?? ''
+      : modelKey === 'qwen27b'
+        ? MODEL_FILES.qwen27b
+        : MODEL_FILES.qwen9b
+  if (!localModelFile) {
+    throw new Error('Select a local model file first.')
+  }
+  const localModelPath = path.join(modelsDir, localModelFile)
+  if (!existsSync(localModelPath)) {
     throw new Error(
-      `Missing model file for ${modelKey}. Place ${expectedFile} in your models folder.`,
+      `Missing model file for local model. Place ${localModelFile} in your models folder.`,
     )
   }
 
-  const modelPath = resolveModelPath(modelKey, modelsDir)
+  const modelPath = localModelPath
   const engineDir = resourcesEngineDir()
   await llama.ensureRunning({ engineDir, modelPath, nGpuLayers })
 
@@ -309,7 +396,7 @@ export async function runTranslateJob(
           })
         }
 
-        let out = cleanSingleLineOutput(full)
+        let out = cleanSingleLineOutput(source, full)
         const needsRetry =
           looksUntranslated(source, out) ||
           looksLikeGlossaryEcho(out) ||
@@ -324,7 +411,7 @@ export async function runTranslateJob(
           })) {
             strictFull += piece
           }
-          out = cleanSingleLineOutput(strictFull)
+          out = cleanSingleLineOutput(source, strictFull)
           const stillBad =
             looksUntranslated(source, out) ||
             looksLikeGlossaryEcho(out) ||
@@ -339,8 +426,13 @@ export async function runTranslateJob(
             })) {
               bareStrictFull += piece
             }
-            out = cleanSingleLineOutput(bareStrictFull)
+            out = cleanSingleLineOutput(source, bareStrictFull)
           }
+        }
+        const expectedLines = splitCueLines(source).length
+        if (expectedLines > 1 && splitCueLines(out).length < expectedLines) {
+          const perLine = await translateMultilineCueByLine(llama, modelKey, source, translationMemory)
+          if (perLine) out = perLine
         }
 
         if (
@@ -382,10 +474,13 @@ export async function runTranslateOneCue(
   opts: {
     cue: SubtitleCue
     modelKey: ModelId
+    localModelFile?: string
     modelsDir: string
     nGpuLayers: number
     geminiApiKey?: string
+    geminiModelId?: string
     openaiApiKey?: string
+    openaiModelId?: string
     openaiTier?: OpenAiTier
     targetLanguage?: TranslationLanguage
     translationMemory?: TranslationMemoryEntry[]
@@ -408,6 +503,7 @@ export async function runTranslateOneCue(
     return runGeminiTranslateOneCue(win, llama, {
       cue,
       apiKey: key,
+      modelId: opts.geminiModelId,
       targetLanguage: opts.targetLanguage ?? 'myanmar',
       translationMemory,
     })
@@ -424,20 +520,30 @@ export async function runTranslateOneCue(
     return runOpenAiTranslateOneCue(win, llama, {
       cue,
       apiKey: key,
+      modelId: opts.openaiModelId,
       tier,
       targetLanguage: opts.targetLanguage ?? 'myanmar',
       translationMemory,
     })
   }
 
-  if (!modelExists(modelKey, modelsDir)) {
-    const expectedFile = modelKey === 'qwen27b' ? MODEL_FILES.qwen27b : MODEL_FILES.qwen9b
+  const localModelFile =
+    modelKey === 'local'
+      ? opts.localModelFile?.trim() ?? ''
+      : modelKey === 'qwen27b'
+        ? MODEL_FILES.qwen27b
+        : MODEL_FILES.qwen9b
+  if (!localModelFile) {
+    throw new Error('Select a local model file first.')
+  }
+  const localModelPath = path.join(modelsDir, localModelFile)
+  if (!existsSync(localModelPath)) {
     throw new Error(
-      `Missing model file for ${modelKey}. Place ${expectedFile} in your models folder.`,
+      `Missing model file for local model. Place ${localModelFile} in your models folder.`,
     )
   }
 
-  const modelPath = resolveModelPath(modelKey, modelsDir)
+  const modelPath = localModelPath
   const engineDir = resourcesEngineDir()
   await llama.ensureRunning({ engineDir, modelPath, nGpuLayers })
 
@@ -461,7 +567,7 @@ export async function runTranslateOneCue(
     })
   }
 
-  let out = cleanSingleLineOutput(full)
+  let out = cleanSingleLineOutput(source, full)
   const needsRetry =
     looksUntranslated(source, out) ||
     looksLikeGlossaryEcho(out) ||
@@ -476,7 +582,7 @@ export async function runTranslateOneCue(
     })) {
       strictFull += piece
     }
-    out = cleanSingleLineOutput(strictFull)
+    out = cleanSingleLineOutput(source, strictFull)
     const stillBad =
       looksUntranslated(source, out) ||
       looksLikeGlossaryEcho(out) ||
@@ -491,8 +597,13 @@ export async function runTranslateOneCue(
       })) {
         bareStrictFull += piece
       }
-      out = cleanSingleLineOutput(bareStrictFull)
+      out = cleanSingleLineOutput(source, bareStrictFull)
     }
+  }
+  const expectedLines = splitCueLines(source).length
+  if (expectedLines > 1 && splitCueLines(out).length < expectedLines) {
+    const perLine = await translateMultilineCueByLine(llama, modelKey, source, translationMemory)
+    if (perLine) out = perLine
   }
 
   if (

@@ -1,23 +1,65 @@
-# Burmese Subtitle Translator (offline)
+# Burmese Subtitle Translator
 
-Desktop app for translating `.srt` subtitles **English → Burmese** using **local Qwen GGUF** models and **llama.cpp** (`llama-server`). Pick **Performance** (smaller) or **Quality** (27B) in the app. No cloud APIs, no Ollama.
+Desktop app for translating `.srt` subtitles (English -> Myanmar or Thai) with:
 
-## Layout
+- **Local GGUF models** via `llama.cpp` (`llama-server`)
+- **Cloud models** via **Google AI (Gemini)** or **OpenAI**
+
+No Ollama is required.
+
+## Project Layout
 
 | Path | Purpose |
 |------|---------|
-| `app/` | Electron + React (electron-vite) |
-| `engine/` | `llama-server.exe` + optional GPU DLLs (you provide binaries) |
-| `models/` | `qwen3_5_9b.gguf` (Performance), `Qwen3.5-27B-Q4_K_M.gguf` (Quality) |
-| `utils/` | SRT parse/serialize, batching, prompts, output parsing |
-| `LICENSES/` | Third-party notices |
+| `app/` | Electron + React app (`electron-vite`) |
+| `engine/` | `llama-server.exe` and optional GPU runtime DLLs |
+| `models/` | Local `.gguf` files for offline/local inference |
+| `utils/` | shared types, prompts, batch helpers, SRT parse/serialize |
+| `LICENSES/` | third-party notices |
+
+## How The App Works
+
+### 1) Translation mode flow
+
+In the app menu:
+
+1. Choose **Mode**:
+   - `Local`
+   - `Cloud`
+2. If `Local`: choose one detected `.gguf` file from your `models` folder.
+3. If `Cloud`:
+   - choose provider: `Google AI` or `OpenAI`
+   - choose specific model from available list
+   - save API key for that provider
+
+### 2) Translation execution flow
+
+- Subtitles are grouped into batches (default 7 cues per batch, 3 in fast test mode).
+- For each batch, the app builds a strict translation prompt with optional memory hints.
+- The app streams partial output to UI while translating.
+- Output is parsed and validated; suspicious output triggers stricter retry logic.
+- For multiline cues, fallback logic preserves line count and can translate line-by-line if needed.
+
+### 3) Memory flow
+
+The app uses two visible memory sources:
+
+- **Train Data** (manual glossary/training)
+- **Memory Data** (saved memory entries, including export-learned entries)
+
+Effective memory = merged default + optional sequel preset memory.
+
+Note: translation no longer auto-inserts hidden memory entries on each run.
 
 ## Prerequisites
 
 - **Node.js 20+** and npm
-- **Windows x64** for the packaged `.exe`
-- **llama.cpp** Windows build with **`llama-server.exe`** in `engine/` (see `engine/README.txt`)
-- **Qwen GGUF** files in `models/` (or `%APPDATA%\burmese-subtitle-translator\models`): **`qwen3_5_9b.gguf`** for Performance, **`Qwen3.5-27B-Q4_K_M.gguf`** for Quality. You can install one or both; the app checks the file for the selected tier. On **12 GB VRAM** (e.g. RTX 3060), the 27B model usually uses **partial GPU offload**; lower `SUBTITLE_LLM_NGL` if you hit OOM.
+- **Windows x64** (for packaged app target)
+- For Local mode:
+  - `llama-server.exe` available in `engine/`
+  - one or more `.gguf` models in `models/` (or copied to app data cache)
+- For Cloud mode:
+  - valid API key for Google AI and/or OpenAI
 
 ## Development
 
@@ -27,7 +69,7 @@ npm install
 npm run dev
 ```
 
-## Production build (Windows installer)
+## Build (Windows installer)
 
 ```powershell
 cd app
@@ -36,25 +78,31 @@ npm run build
 npm run dist
 ```
 
-Artifacts appear under `app/release/` (NSIS installer and unpacked `win-unpacked`).
+Build artifacts are written to `app/release/`.
 
-If `electron-builder` fails while extracting signing tools (symlink permission errors), either enable **Developer Mode** on Windows or run the build from an environment where symlinks are allowed; the sample `package.json` sets `forceCodeSigning: false` and `signAndEditExecutable: false` to reduce signing-tool dependencies.
+## Runtime Notes
 
-## GPU vs CPU
-
-In the app toolbar, **Inference** selects:
-
-- **GPU (`-ngl N`)** — GPU offload (default **N = 99**, or set via environment before first run).
-- **CPU (no GPU offload)** — omits `-ngl` so inference stays on the CPU (slower; works without a GPU).
-
-You can still tune the GPU layer count for **GPU** mode when launching (affects the default N):
+- **Local inference mode**
+  - GPU: uses `-ngl N` offload (`N` default is 99)
+  - CPU: disables GPU offload
+- Tune local GPU offload default with:
 
 ```powershell
 $env:SUBTITLE_LLM_NGL="35"
 ```
 
-Use `SUBTITLE_LLM_NGL=0` only if you want the **default stored value** to start at CPU; the in-app **Inference** dropdown always overrides the saved setting.
+- Cloud model speed depends on network/provider load.
+- Gemini high-demand errors (`503`) are retried with backoff in app.
+
+## Configuration Environment Variables
+
+- `SUBTITLE_LLM_NGL`: default local GPU layer count
+- `SUBTITLE_FAST_TEST=1`: smaller batch size (faster iteration, lower throughput)
+- `SUBTITLE_GEMINI_MODEL`: fallback Gemini model if UI/model config is not set
+- `SUBTITLE_OPENAI_MODEL_NORMAL`: fallback OpenAI model for normal tier
+- `SUBTITLE_OPENAI_MODEL_PREMIUM`: fallback OpenAI model for premium tier
 
 ## Licensing
 
-This project does not redistribute model weights or llama.cpp binaries. Use third-party materials only under their respective licenses.
+This repository does not ship proprietary model weights or `llama.cpp` binaries.
+Use all third-party binaries/models under their respective licenses.
